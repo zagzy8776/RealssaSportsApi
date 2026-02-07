@@ -2,33 +2,48 @@
 build/
 out/
 cmake-build-*/
-
-# Visual Studio
 .vs/
-*.user
-*.suo
-*.sln
-*.vcxproj
-*.vcxproj.filters
+.vscode/
+x64/
+Debug/
+Release/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!CMakeLists.txt
 
 # Compiled files
 *.exe
-*.obj
+*.out
+*.app
 *.o
-*.dll
+*.obj
 *.lib
-*.pdb
+*.dll
+*.so
+*.dylib
 
-# Environment files
+# IDE files
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+.idea/
+
+# Environment files (IMPORTANT - don't commit API keys!)
 .env
+.env.local
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
 
 # vcpkg
 vcpkg_installed/
-
-# CMake
-CMakeCache.txt
-CMakeFiles/
-
-# Windows
-Thumbs.db
-Desktop.ini
