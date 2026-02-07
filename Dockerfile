@@ -1,8 +1,8 @@
 # Use a slim version of Debian as the base
 FROM debian:12-slim
 
-# Install necessary build tools
-RUN apt-get update && apt-get install -y git build-essential cmake curl zip unzip tar pkg-config
+# Install necessary build tools - ADDED ninja-build HERE
+RUN apt-get update && apt-get install -y git build-essential cmake ninja-build curl zip unzip tar pkg-config
 
 # Install vcpkg
 RUN git clone https://github.com/Microsoft/vcpkg.git /opt/vcpkg && \
