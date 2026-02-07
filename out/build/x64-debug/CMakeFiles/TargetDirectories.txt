@@ -1,0 +1,3 @@
+C:/Users/ZAGZY/source/repos/RealssaSportsApi/out/build/x64-debug/CMakeFiles/RealssaSportsApi.dir
+C:/Users/ZAGZY/source/repos/RealssaSportsApi/out/build/x64-debug/CMakeFiles/edit_cache.dir
+C:/Users/ZAGZY/source/repos/RealssaSportsApi/out/build/x64-debug/CMakeFiles/rebuild_cache.dir
