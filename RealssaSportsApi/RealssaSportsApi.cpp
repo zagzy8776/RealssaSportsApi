@@ -8,14 +8,15 @@
 #include <thread>
 #include <mutex>
 #include <ctime>
+#include <unordered_set>
 
 using json = nlohmann::json;
 
-// QUOTA PROTECTION - CRITICAL SETTINGS
-const int MAX_API_CALLS_PER_DAY = 450;  // Safety limit (out of 500 free tier)
-const int CACHE_DURATION_HOURS = 3;      // Cache data for 3 hours minimum
+// QUOTA PROTECTION - UPDATED SETTINGS
+const int MAX_API_CALLS_PER_DAY = 450;
+const int CACHE_DURATION_HOURS = 2;      // Reduced from 3 to 2
 const int POLL_INTERVAL_NO_LIVE = 60;    // 60 minutes when no live matches
-const int POLL_INTERVAL_WITH_LIVE = 10;  // 10 minutes when live matches exist
+const int POLL_INTERVAL_WITH_LIVE = 3;   // 3 minutes when live (FASTER!)
 
 // Global state
 json cached_fixtures;
@@ -72,7 +73,6 @@ bool canMakeApiCall() {
 // Helper function to make RapidAPI requests with quota protection
 cpr::Response makeRapidApiRequest(const std::string& endpoint, const std::string& apiKey) {
     if (!canMakeApiCall()) {
-        // Return empty response if quota exceeded
         return cpr::Response{};
     }
 
@@ -82,10 +82,9 @@ cpr::Response makeRapidApiRequest(const std::string& endpoint, const std::string
             {"x-rapidapi-host", "sportapi7.p.rapidapi.com"},
             {"x-rapidapi-key", apiKey}
         },
-        cpr::Timeout{ 10000 }  // 10 second timeout
+        cpr::Timeout{ 10000 }
     );
 
-    // Only increment if we got a response
     if (response.status_code != 0) {
         std::lock_guard<std::mutex> lock(counter_mutex);
         api_calls_today++;
@@ -100,7 +99,6 @@ json formatMatch(const json& event, const std::string& dateLabel) {
     json match;
 
     try {
-        // Extract basic info
         match["id"] = event.value("id", 0);
         match["date"] = dateLabel;
 
@@ -138,30 +136,33 @@ json formatMatch(const json& event, const std::string& dateLabel) {
             match["away_score"] = 0;
         }
 
-        // Status
+        // Status - IMPROVED MAPPING
         if (event.contains("status") && event["status"].is_object()) {
             int statusCode = event["status"].value("code", 0);
             std::string statusType = event["status"].value("type", "");
 
-            // Map status codes
+            // Map status codes more accurately
             if (statusCode == 100 || statusType == "inprogress") {
-                match["statusId"] = 2; // Live
+                match["statusId"] = 2;
                 match["statusName"] = "LIVE";
             }
             else if (statusCode == 120 || statusCode == 110 || statusType == "finished") {
-                match["statusId"] = 6; // Finished
+                match["statusId"] = 6;
                 match["statusName"] = "FT";
             }
             else if (statusCode == 31) {
-                match["statusId"] = 2;
-                match["statusName"] = "HT"; // Half Time
+                match["statusId"] = 3;
+                match["statusName"] = "HT";
+            }
+            else if (statusCode == 0 || statusType == "notstarted") {
+                match["statusId"] = 1;
+                match["statusName"] = "VS";
             }
             else {
-                match["statusId"] = 1; // Scheduled
+                match["statusId"] = 1;
                 match["statusName"] = "VS";
             }
 
-            // Add time info
             if (event["status"].contains("description")) {
                 match["time"] = event["status"]["description"];
             }
@@ -181,7 +182,6 @@ json formatMatch(const json& event, const std::string& dateLabel) {
             }
         }
 
-        // Start time (Unix timestamp)
         if (event.contains("startTimestamp")) {
             match["timestamp"] = event["startTimestamp"];
         }
@@ -194,7 +194,29 @@ json formatMatch(const json& event, const std::string& dateLabel) {
     return match;
 }
 
-// Refresh fixture cache - ULTRA CONSERVATIVE VERSION
+// NEW: Mark matches as finished if they're not in the live feed
+void markFinishedMatches(json& allMatches, const std::unordered_set<int>& liveMatchIds) {
+    if (!allMatches.contains("data") || !allMatches["data"].is_array()) {
+        return;
+    }
+
+    for (auto& match : allMatches["data"]) {
+        if (!match.contains("id")) continue;
+
+        int matchId = match["id"].get<int>();
+        int statusId = match.value("statusId", 1);
+
+        // If match was LIVE (statusId == 2) but is NOT in current live feed, mark as finished
+        if (statusId == 2 && liveMatchIds.find(matchId) == liveMatchIds.end()) {
+            match["statusId"] = 6;
+            match["statusName"] = "FT";
+            match["date"] = "finished";
+            std::cout << "   ✅ Marked match " << matchId << " as finished" << std::endl;
+        }
+    }
+}
+
+// Refresh fixture cache - IMPROVED VERSION
 void refreshFixtureCache(const std::string& apiKey) {
     checkAndResetDailyCounter();
 
@@ -203,27 +225,54 @@ void refreshFixtureCache(const std::string& apiKey) {
         now - last_fixture_fetch
     ).count();
 
-    // STRICT CACHING: Only refresh if cache is old enough
+    // Check if we should skip this refresh
     if (hours_since_fetch < CACHE_DURATION_HOURS && !cached_fixtures.empty()) {
-        std::cout << "💾 Using cached fixtures (last fetch: " << hours_since_fetch << "h ago, expires in "
-            << (CACHE_DURATION_HOURS - hours_since_fetch) << "h)" << std::endl;
+        // BUT: Always update live match statuses even if cache is fresh
+        if (canMakeApiCall()) {
+            std::cout << "🔄 Quick status update (cache still fresh)..." << std::endl;
+
+            auto liveResponse = makeRapidApiRequest("/api/v1/sport/football/events/live", apiKey);
+
+            if (liveResponse.status_code == 200) {
+                try {
+                    auto data = json::parse(liveResponse.text);
+                    std::unordered_set<int> currentLiveIds;
+
+                    if (data.contains("events") && data["events"].is_array()) {
+                        for (const auto& event : data["events"]) {
+                            if (event.contains("id")) {
+                                currentLiveIds.insert(event["id"].get<int>());
+                            }
+                        }
+                    }
+
+                    std::lock_guard<std::mutex> lock(cache_mutex);
+                    markFinishedMatches(cached_fixtures, currentLiveIds);
+
+                    std::cout << "   ✅ Status update complete" << std::endl;
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "   ❌ Parse error: " << e.what() << std::endl;
+                }
+            }
+        }
         return;
     }
 
-    // QUOTA CHECK before fetching
     if (!canMakeApiCall()) {
         std::cout << "⏸️  Skipping cache refresh - quota protection active" << std::endl;
         return;
     }
 
-    std::cout << "\n🔄 Refreshing fixture cache..." << std::endl;
+    std::cout << "\n🔄 Full cache refresh..." << std::endl;
 
     json allFixtures;
     allFixtures["data"] = json::array();
+    std::unordered_set<int> liveMatchIds;
 
     std::string today = getTodayDate();
 
-    // ENDPOINT 1: Live Events (MOST IMPORTANT)
+    // ENDPOINT 1: Live Events
     std::cout << "📡 Fetching LIVE events..." << std::endl;
     auto liveResponse = makeRapidApiRequest("/api/v1/sport/football/events/live", apiKey);
 
@@ -235,6 +284,9 @@ void refreshFixtureCache(const std::string& apiKey) {
                 std::cout << "   ✅ Found " << data["events"].size() << " live matches" << std::endl;
 
                 for (auto& event : data["events"]) {
+                    if (event.contains("id")) {
+                        liveMatchIds.insert(event["id"].get<int>());
+                    }
                     allFixtures["data"].push_back(formatMatch(event, "live"));
                 }
             }
@@ -250,17 +302,16 @@ void refreshFixtureCache(const std::string& apiKey) {
         std::cerr << "   ❌ Invalid API Key!" << std::endl;
     }
     else if (liveResponse.status_code == 429) {
-        std::cerr << "   ❌ RATE LIMIT HIT - Stopping all requests!" << std::endl;
-        api_calls_today = MAX_API_CALLS_PER_DAY; // Block further calls
+        std::cerr << "   ❌ RATE LIMIT HIT!" << std::endl;
+        api_calls_today = MAX_API_CALLS_PER_DAY;
         return;
     }
 
-    // Small delay between requests
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // ENDPOINT 2: Scheduled Events for Today (ONLY if we have quota left)
+    // ENDPOINT 2: Scheduled Events
     if (canMakeApiCall()) {
-        std::cout << "📡 Fetching scheduled events for today..." << std::endl;
+        std::cout << "📡 Fetching scheduled events..." << std::endl;
         auto scheduledResponse = makeRapidApiRequest(
             "/api/v1/sport/football/scheduled-events/" + today,
             apiKey
@@ -310,7 +361,7 @@ int countLiveMatches() {
     return count;
 }
 
-// Background polling thread - ULTRA CONSERVATIVE
+// Background polling thread
 void backgroundPoller(const std::string& apiKey) {
     while (true) {
         refreshFixtureCache(apiKey);
@@ -322,7 +373,6 @@ void backgroundPoller(const std::string& apiKey) {
             live_match_count = liveMatches;
         }
 
-        // CONSERVATIVE POLLING: Long intervals to protect quota
         int pollInterval = (liveMatches > 0) ? POLL_INTERVAL_WITH_LIVE : POLL_INTERVAL_NO_LIVE;
 
         std::cout << "\n📊 Quota Status:" << std::endl;
@@ -337,7 +387,6 @@ void backgroundPoller(const std::string& apiKey) {
 int main() {
     crow::SimpleApp app;
 
-    // Get API key from environment
     const char* api_key_env = std::getenv("RAPIDAPI_KEY");
     if (!api_key_env) {
         std::cerr << "❌ ERROR: RAPIDAPI_KEY environment variable not set!" << std::endl;
@@ -347,7 +396,6 @@ int main() {
     std::string api_key = api_key_env;
     std::cout << "✅ API Key: " << api_key.substr(0, 10) << "..." << std::endl;
 
-    // Initialize cache and counters
     cached_fixtures["data"] = json::array();
     last_fixture_fetch = std::chrono::system_clock::now() - std::chrono::hours(CACHE_DURATION_HOURS + 1);
     last_reset_date = std::chrono::system_clock::now();
@@ -358,30 +406,25 @@ int main() {
     std::cout << "   Poll Interval (No Live): " << POLL_INTERVAL_NO_LIVE << " min" << std::endl;
     std::cout << "   Poll Interval (Live): " << POLL_INTERVAL_WITH_LIVE << " min" << std::endl;
 
-    // Start background polling
     std::thread poller(backgroundPoller, api_key);
     poller.detach();
 
-    // Health check endpoint
     CROW_ROUTE(app, "/")
         ([]() {
         crow::response res;
         res.set_header("Content-Type", "application/json");
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.write("{\n  \"message\": \"RealSSA Sports API - Quota Protected\",\n  \"status\": \"online\",\n  \"version\": \"9.0.0 - Ultra Safe\"\n}");
+        res.write("{\n  \"message\": \"RealSSA Sports API - Smart Status Tracking\",\n  \"status\": \"online\",\n  \"version\": \"10.0.0 - Auto-Finish Detection\"\n}");
         return res;
             });
 
-    // Scores endpoint
     CROW_ROUTE(app, "/scores")
         ([&api_key]() {
-        // Check if cache needs refresh (but respect quota limits)
         auto now = std::chrono::system_clock::now();
         auto hours_since = std::chrono::duration_cast<std::chrono::hours>(
             now - last_fixture_fetch
         ).count();
 
-        // Only force refresh if cache is VERY old and we have quota
         if (hours_since >= CACHE_DURATION_HOURS && canMakeApiCall()) {
             refreshFixtureCache(api_key);
         }
@@ -392,7 +435,6 @@ int main() {
             response = cached_fixtures;
         }
 
-        // Add metadata
         response["quota_status"] = {
             {"calls_used", api_calls_today},
             {"calls_limit", MAX_API_CALLS_PER_DAY},
@@ -406,39 +448,55 @@ int main() {
         return res;
             });
 
-    // Health endpoint with detailed stats
+    // NEW: Stats endpoint
+    CROW_ROUTE(app, "/stats/<int>")
+        ([&api_key](int match_id) {
+        std::string endpoint = "/api/v1/event/" + std::to_string(match_id) + "/statistics";
+
+        if (!canMakeApiCall()) {
+            crow::response res(503);
+            res.set_header("Content-Type", "application/json");
+            res.write("{\"error\": \"Quota limit reached\"}");
+            return res;
+        }
+
+        auto statsResponse = makeRapidApiRequest(endpoint, api_key);
+
+        crow::response res;
+        res.set_header("Content-Type", "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+
+        if (statsResponse.status_code == 200) {
+            res.write(statsResponse.text);
+        }
+        else {
+            res.code = 404;
+            res.write("{\"error\": \"Stats not available\"}");
+        }
+
+        return res;
+            });
+
     CROW_ROUTE(app, "/health")
         ([]() {
         json health;
         health["status"] = "online";
-        health["engine"] = "RealSSA Quota-Protected Engine";
-        health["api_provider"] = "sportapi7.p.rapidapi.com";
-        health["version"] = "9.0.0 - Ultra Safe";
+        health["engine"] = "RealSSA Smart Engine";
+        health["version"] = "10.0.0";
         health["today"] = getTodayDate();
-
-        // Quota information
         health["quota"] = {
             {"calls_today", api_calls_today},
             {"max_calls_per_day", MAX_API_CALLS_PER_DAY},
-            {"calls_remaining", MAX_API_CALLS_PER_DAY - api_calls_today},
-            {"quota_exhausted", api_calls_today >= MAX_API_CALLS_PER_DAY}
+            {"calls_remaining", MAX_API_CALLS_PER_DAY - api_calls_today}
         };
-
-        // Match stats
         health["matches"] = {
             {"live", live_match_count},
             {"total_cached", cached_fixtures.contains("data") ? cached_fixtures["data"].size() : 0}
         };
-
-        // System info
         health["cache"] = {
             {"duration_hours", CACHE_DURATION_HOURS},
-            {"poll_interval_no_live_min", POLL_INTERVAL_NO_LIVE},
             {"poll_interval_live_min", POLL_INTERVAL_WITH_LIVE}
         };
-
-        health["server_time"] = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        health["features"] = { "ultra_conservative_quota", "smart_caching", "dynamic_polling", "auto_quota_reset" };
 
         crow::response res;
         res.set_header("Content-Type", "application/json");
@@ -447,7 +505,6 @@ int main() {
         return res;
             });
 
-    // Get port from environment or default to 8080
     const char* port_env = std::getenv("PORT");
     int port = port_env ? std::stoi(port_env) : 8080;
 
