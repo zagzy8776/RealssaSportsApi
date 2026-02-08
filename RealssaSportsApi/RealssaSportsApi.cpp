@@ -69,23 +69,35 @@ void fetchAllMatches(const std::string& apiKey) {
                 {"x-rapidapi-key", apiKey},
                 {"x-rapidapi-host", "free-api-live-football-data.p.rapidapi.com"}
             },
-            cpr::Parameters{ {"date", dateParam} }  // Format: YYYYMMDD (e.g., "20260208")
+            cpr::Parameters{ {"date", dateParam} }
         );
 
         if (matchesRes.status_code == 200) {
             try {
                 auto matchData = json::parse(matchesRes.text);
 
+                // Handle different response structures
                 if (matchData.contains("data") && matchData["data"].is_array()) {
                     allMatches["data"] = matchData["data"];
                     std::cout << "✅ Matches by date: " << matchData["data"].size() << " matches" << std::endl;
                 }
-                else if (matchData.contains("response") && matchData["response"].is_array()) {
-                    allMatches["data"] = matchData["response"];
-                    std::cout << "✅ Matches by date: " << matchData["response"].size() << " matches" << std::endl;
+                else if (matchData.contains("response")) {
+                    // Check if response.matches exists (THIS WAS THE FIX!)
+                    if (matchData["response"].contains("matches") && matchData["response"]["matches"].is_array()) {
+                        allMatches["data"] = matchData["response"]["matches"];
+                        std::cout << "✅ Matches by date: " << matchData["response"]["matches"].size() << " matches" << std::endl;
+                    }
+                    else if (matchData["response"].is_array()) {
+                        allMatches["data"] = matchData["response"];
+                        std::cout << "✅ Matches by date: " << matchData["response"].size() << " matches" << std::endl;
+                    }
+                    else {
+                        std::cout << "⚠️ Unexpected 'response' structure" << std::endl;
+                        std::cerr << "   Sample response: " << matchesRes.text.substr(0, 300) << "..." << std::endl;
+                    }
                 }
                 else {
-                    std::cout << "⚠️ No 'data' or 'response' array in matches response" << std::endl;
+                    std::cout << "⚠️ No 'data' or 'response' in matches response" << std::endl;
                     std::cerr << "   Sample response: " << matchesRes.text.substr(0, 300) << "..." << std::endl;
                 }
             }
@@ -113,10 +125,26 @@ void fetchAllMatches(const std::string& apiKey) {
             try {
                 auto liveData = json::parse(liveRes.text);
                 int liveCount = 0;
+                json liveMatchesArray = json::array();
 
+                // Extract live matches from different structures
                 if (liveData.contains("data") && liveData["data"].is_array()) {
-                    liveCount = liveData["data"].size();
+                    liveMatchesArray = liveData["data"];
+                    liveCount = liveMatchesArray.size();
+                }
+                else if (liveData.contains("response")) {
+                    // Also check for response.matches in live data
+                    if (liveData["response"].contains("matches") && liveData["response"]["matches"].is_array()) {
+                        liveMatchesArray = liveData["response"]["matches"];
+                        liveCount = liveMatchesArray.size();
+                    }
+                    else if (liveData["response"].is_array()) {
+                        liveMatchesArray = liveData["response"];
+                        liveCount = liveMatchesArray.size();
+                    }
+                }
 
+                if (liveCount > 0) {
                     // Create a map of existing match IDs to avoid duplicates
                     std::map<std::string, size_t> existingIds;
                     for (size_t i = 0; i < allMatches["data"].size(); i++) {
@@ -130,7 +158,7 @@ void fetchAllMatches(const std::string& apiKey) {
                     }
 
                     // Merge or update with live data
-                    for (auto& liveMatch : liveData["data"]) {
+                    for (auto& liveMatch : liveMatchesArray) {
                         if (liveMatch.contains("id")) {
                             std::string matchId = liveMatch["id"].is_string() ?
                                 liveMatch["id"].get<std::string>() :
@@ -153,14 +181,6 @@ void fetchAllMatches(const std::string& apiKey) {
 
                     std::cout << "✅ Live matches: " << liveCount << " matches" << std::endl;
                 }
-                else if (liveData.contains("response") && liveData["response"].is_array()) {
-                    liveCount = liveData["response"].size();
-                    std::cout << "✅ Live matches: " << liveCount << " matches" << std::endl;
-
-                    for (auto& liveMatch : liveData["response"]) {
-                        allMatches["data"].push_back(liveMatch);
-                    }
-                }
                 else {
                     std::cout << "ℹ️  No live matches currently" << std::endl;
                 }
@@ -172,9 +192,6 @@ void fetchAllMatches(const std::string& apiKey) {
         }
         else {
             std::cerr << "⚠️ Live endpoint error: HTTP " << liveRes.status_code << std::endl;
-            if (liveRes.status_code != 404) {
-                std::cerr << "   Response: " << liveRes.text.substr(0, 300) << "..." << std::endl;
-            }
         }
 
         // ========== Save the combined data ==========
