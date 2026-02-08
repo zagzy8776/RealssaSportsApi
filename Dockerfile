@@ -1,3 +1,6 @@
+Here's the complete updated Dockerfile:
+
+```dockerfile
 FROM debian:12-slim
 
 # Install necessary build tools
@@ -19,8 +22,8 @@ RUN git clone https://github.com/CrowCpp/Crow.git /opt/crow
 WORKDIR /app
 COPY . .
 
-# Install dependencies via vcpkg
-RUN /opt/vcpkg/vcpkg install cpr nlohmann-json cpp-httplib
+# Install dependencies via vcpkg (Added asio for Crow)
+RUN /opt/vcpkg/vcpkg install cpr nlohmann-json cpp-httplib asio
 
 # Build the project
 RUN mkdir -p build && cd build && \
@@ -32,3 +35,6 @@ RUN mkdir -p build && cd build && \
 
 # Run the application
 CMD ["./build/RealssaSportsApi"]
+```
+
+Just copy and paste this entire file to replace your current Dockerfile, then commit and push! 🎯
