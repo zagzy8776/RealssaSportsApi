@@ -6,7 +6,6 @@
 #include <mutex>
 #include <map>
 #include <set>
-#include <algorithm>
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <httplib.h>
@@ -17,383 +16,341 @@ using json = nlohmann::json;
 std::string latest_match_data = "{\"status\": \"initializing\"}";
 std::mutex data_mutex;
 
-// Request counter (resets daily)
-int request_count = 0;
-int daily_limit = 95; // Keep 5 as buffer
-std::mutex counter_mutex;
-std::chrono::system_clock::time_point last_reset;
-
-// Cache for fixtures (refreshed every 6 hours)
+// Cached fixture data (refreshed less frequently)
+json cached_fixtures;
 std::chrono::system_clock::time_point last_fixture_fetch;
-const int FIXTURE_CACHE_HOURS = 6;
+std::mutex cache_mutex;
 
-// Structure to hold date info
-struct DateInfo {
-    std::string display;  // YYYY-MM-DD format
+// Request counter
+int api_calls_today = 0;
+std::mutex counter_mutex;
+
+// Priority leagues (to reduce API calls)
+const std::vector<std::string> PRIORITY_LEAGUES = {
+    "PL",   // Premier League
+    "PD",   // La Liga
+    "SA",   // Serie A
+    "BL1",  // Bundesliga
+    "FL1",  // Ligue 1
+    "CL",   // Champions League
+    "WC",   // World Cup
+    "EC"    // European Championship
 };
 
-// Function to get a date offset by days (using UTC)
-DateInfo getDateWithOffset(int dayOffset) {
+// Function to get current date in YYYY-MM-DD format (Cross-platform)
+std::string getTodayDate() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    struct tm timeinfo;
+
+#ifdef _WIN32
+    localtime_s(&timeinfo, &now_time);
+#else
+    localtime_r(&now_time, &timeinfo);
+#endif
+
+    char buffer[11];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
+    return std::string(buffer);
+}
+
+// Get date with offset
+std::string getDateWithOffset(int dayOffset) {
     auto now = std::chrono::system_clock::now();
     auto target = now + std::chrono::hours(24 * dayOffset);
     std::time_t target_time = std::chrono::system_clock::to_time_t(target);
-
     struct tm timeinfo;
+
 #ifdef _WIN32
-    gmtime_s(&timeinfo, &target_time);
+    localtime_s(&timeinfo, &target_time);
 #else
-    gmtime_r(&target_time, &timeinfo);
+    localtime_r(&target_time, &timeinfo);
 #endif
 
-    DateInfo date;
-    char displayBuffer[11];
-    strftime(displayBuffer, sizeof(displayBuffer), "%Y-%m-%d", &timeinfo);
-    date.display = std::string(displayBuffer);
-
-    return date;
+    char buffer[11];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
+    return std::string(buffer);
 }
 
-// Check if we can make a request
-bool canMakeRequest() {
-    std::lock_guard<std::mutex> lock(counter_mutex);
+// Format match data from API
+json formatMatch(const json& match, const std::string& dateLabel = "") {
+    json formattedMatch;
 
+    formattedMatch["id"] = match.value("id", 0);
+    formattedMatch["time"] = match.value("utcDate", "");
+
+    // Teams
+    formattedMatch["home"]["name"] = match["homeTeam"].value("name", "");
+    formattedMatch["home"]["shortName"] = match["homeTeam"].value("shortName", "");
+    formattedMatch["home"]["tla"] = match["homeTeam"].value("tla", "");
+    formattedMatch["home"]["crest"] = match["homeTeam"].value("crest", "");
+
+    formattedMatch["away"]["name"] = match["awayTeam"].value("name", "");
+    formattedMatch["away"]["shortName"] = match["awayTeam"].value("shortName", "");
+    formattedMatch["away"]["tla"] = match["awayTeam"].value("tla", "");
+    formattedMatch["away"]["crest"] = match["awayTeam"].value("crest", "");
+
+    // Scores
+    if (match.contains("score") && match["score"].contains("fullTime")) {
+        formattedMatch["home"]["score"] = match["score"]["fullTime"]["home"].is_null() ? 0 : match["score"]["fullTime"]["home"].get<int>();
+        formattedMatch["away"]["score"] = match["score"]["fullTime"]["away"].is_null() ? 0 : match["score"]["fullTime"]["away"].get<int>();
+    }
+    else {
+        formattedMatch["home"]["score"] = 0;
+        formattedMatch["away"]["score"] = 0;
+    }
+
+    // Half-time score
+    if (match.contains("score") && match["score"].contains("halfTime")) {
+        formattedMatch["halftime"]["home"] = match["score"]["halfTime"]["home"].is_null() ? 0 : match["score"]["halfTime"]["home"].get<int>();
+        formattedMatch["halftime"]["away"] = match["score"]["halfTime"]["away"].is_null() ? 0 : match["score"]["halfTime"]["away"].get<int>();
+    }
+
+    // Status
+    std::string status = match.value("status", "SCHEDULED");
+    formattedMatch["status"] = status;
+    formattedMatch["status_text"] = status;
+
+    if (status == "IN_PLAY" || status == "PAUSED") {
+        formattedMatch["statusId"] = 2; // Live
+        formattedMatch["is_live"] = true;
+    }
+    else if (status == "FINISHED") {
+        formattedMatch["statusId"] = 6; // Finished
+        formattedMatch["is_live"] = false;
+    }
+    else {
+        formattedMatch["statusId"] = 1; // Scheduled
+        formattedMatch["is_live"] = false;
+    }
+
+    // Competition/League
+    if (match.contains("competition")) {
+        formattedMatch["leagueId"] = match["competition"].value("id", 0);
+        formattedMatch["leagueName"] = match["competition"].value("name", "");
+        formattedMatch["leagueCode"] = match["competition"].value("code", "");
+        formattedMatch["leagueEmblem"] = match["competition"].value("emblem", "");
+    }
+
+    formattedMatch["matchday"] = match.value("matchday", 0);
+    formattedMatch["venue"] = match.value("venue", "");
+
+    if (!dateLabel.empty()) {
+        formattedMatch["date_label"] = dateLabel;
+    }
+
+    return formattedMatch;
+}
+
+// Fetch all fixtures (cached for 2 hours)
+void refreshFixtureCache(const std::string& apiKey) {
     auto now = std::chrono::system_clock::now();
-    auto hours_since_reset = std::chrono::duration_cast<std::chrono::hours>(now - last_reset).count();
+    auto hours_since_fetch = std::chrono::duration_cast<std::chrono::hours>(
+        now - last_fixture_fetch
+    ).count();
 
-    // Reset counter every 24 hours
-    if (hours_since_reset >= 24) {
-        request_count = 0;
-        last_reset = now;
-        std::cout << "🔄 Daily quota reset! Requests: 0/" << daily_limit << std::endl;
+    // Only refresh if 2+ hours have passed
+    if (hours_since_fetch < 2 && !cached_fixtures.empty()) {
+        std::cout << "💾 Using cached fixtures (last fetch: " << hours_since_fetch << "h ago)" << std::endl;
+        return;
     }
 
-    if (request_count >= daily_limit) {
-        std::cout << "⚠️  Daily quota reached (" << request_count << "/" << daily_limit << ")" << std::endl;
-        return false;
-    }
+    std::cout << "\n🔄 Refreshing fixture cache..." << std::endl;
 
-    return true;
-}
+    json allFixtures;
+    allFixtures["data"] = json::array();
 
-// Increment request counter
-void incrementRequestCount() {
-    std::lock_guard<std::mutex> lock(counter_mutex);
-    request_count++;
-    std::cout << "📊 API Calls today: " << request_count << "/" << daily_limit << std::endl;
-}
+    std::string today = getTodayDate();
+    std::string tomorrow = getDateWithOffset(1);
 
-// Fetch live matches (highest priority)
-json fetchLiveMatches(const std::string& apiKey) {
-    json liveMatches = json::array();
-
-    if (!canMakeRequest()) {
-        std::cout << "   ⏭️  Skipping live fetch (quota limit)" << std::endl;
-        return liveMatches;
-    }
-
-    std::cout << "📡 Fetching LIVE matches..." << std::endl;
-
-    auto response = cpr::Get(
-        cpr::Url{ "https://v3.football.api-sports.io/fixtures" },
-        cpr::Header{
-            {"x-apisports-key", apiKey}
-        },
-        cpr::Parameters{
-            {"live", "all"}
-        }
+    // Fetch today's fixtures
+    std::cout << "📡 Fetching today's fixtures (" << today << ")..." << std::endl;
+    auto todayResponse = cpr::Get(
+        cpr::Url{ "https://api.football-data.org/v4/matches" },
+        cpr::Header{ {"X-Auth-Token", apiKey} },
+        cpr::Parameters{ {"dateFrom", today}, {"dateTo", today} }
     );
 
-    incrementRequestCount();
-    std::cout << "   HTTP Status: " << response.status_code << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        api_calls_today++;
+    }
 
-    if (response.status_code == 200) {
+    if (todayResponse.status_code == 200) {
         try {
-            auto data = json::parse(response.text);
-
-            if (data.contains("response") && data["response"].is_array()) {
-                int count = 0;
-                for (auto& fixture : data["response"]) {
-                    json match;
-                    match["id"] = fixture["fixture"].value("id", 0);
-                    match["time"] = fixture["fixture"].value("date", "");
-
-                    // Teams
-                    match["home"]["name"] = fixture["teams"]["home"].value("name", "");
-                    match["home"]["longName"] = fixture["teams"]["home"].value("name", "");
-                    match["home"]["score"] = fixture["goals"]["home"].is_null() ? 0 : fixture["goals"]["home"].get<int>();
-
-                    match["away"]["name"] = fixture["teams"]["away"].value("name", "");
-                    match["away"]["longName"] = fixture["teams"]["away"].value("name", "");
-                    match["away"]["score"] = fixture["goals"]["away"].is_null() ? 0 : fixture["goals"]["away"].get<int>();
-
-                    // Status
-                    std::string status = fixture["fixture"]["status"].value("short", "");
-                    if (status == "1H" || status == "2H" || status == "HT" || status == "LIVE") {
-                        match["statusId"] = 2;  // Live
-                    }
-                    else if (status == "FT" || status == "AET" || status == "PEN") {
-                        match["statusId"] = 6;  // Finished
-                    }
-                    else {
-                        match["statusId"] = 1;  // Scheduled
-                    }
-
-                    match["status_text"] = status;
-                    match["leagueId"] = fixture["league"].value("id", 0);
-                    match["leagueName"] = fixture["league"].value("name", "");
-                    match["is_live"] = true;
-
-                    liveMatches.push_back(match);
-                    count++;
+            auto data = json::parse(todayResponse.text);
+            if (data.contains("matches") && data["matches"].is_array()) {
+                for (auto& match : data["matches"]) {
+                    allFixtures["data"].push_back(formatMatch(match, "today"));
                 }
-                std::cout << "   ✅ Found " << count << " live matches" << std::endl;
+                std::cout << "   ✅ " << data["matches"].size() << " matches" << std::endl;
             }
         }
         catch (const std::exception& e) {
-            std::cerr << "   ❌ Parse error: " << e.what() << std::endl;
+            std::cerr << "   ❌ Error: " << e.what() << std::endl;
         }
     }
     else {
-        std::cerr << "   ❌ API Error: " << response.status_code << std::endl;
+        std::cerr << "   ❌ HTTP " << todayResponse.status_code << std::endl;
     }
 
-    return liveMatches;
-}
+    std::this_thread::sleep_for(std::chrono::seconds(2));
 
-// Fetch fixtures for a date (cached)
-json fetchFixturesForDate(const std::string& apiKey, const std::string& date, const std::string& label) {
-    json fixtures = json::array();
-
-    if (!canMakeRequest()) {
-        std::cout << "   ⏭️  Skipping " << label << " fixtures (quota limit)" << std::endl;
-        return fixtures;
-    }
-
-    std::cout << "📡 Fetching " << label << " fixtures (" << date << ")..." << std::endl;
-
-    auto response = cpr::Get(
-        cpr::Url{ "https://v3.football.api-sports.io/fixtures" },
-        cpr::Header{
-            {"x-apisports-key", apiKey}
-        },
-        cpr::Parameters{
-            {"date", date}
-        }
+    // Fetch tomorrow's fixtures
+    std::cout << "📡 Fetching tomorrow's fixtures (" << tomorrow << ")..." << std::endl;
+    auto tomorrowResponse = cpr::Get(
+        cpr::Url{ "https://api.football-data.org/v4/matches" },
+        cpr::Header{ {"X-Auth-Token", apiKey} },
+        cpr::Parameters{ {"dateFrom", tomorrow}, {"dateTo", tomorrow} }
     );
 
-    incrementRequestCount();
-    std::cout << "   HTTP Status: " << response.status_code << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        api_calls_today++;
+    }
 
-    if (response.status_code == 200) {
+    if (tomorrowResponse.status_code == 200) {
         try {
-            auto data = json::parse(response.text);
-
-            if (data.contains("response") && data["response"].is_array()) {
-                int count = 0;
-                for (auto& fixture : data["response"]) {
-                    json match;
-                    match["id"] = fixture["fixture"].value("id", 0);
-                    match["time"] = fixture["fixture"].value("date", "");
-
-                    // Teams
-                    match["home"]["name"] = fixture["teams"]["home"].value("name", "");
-                    match["home"]["longName"] = fixture["teams"]["home"].value("name", "");
-                    match["home"]["score"] = fixture["goals"]["home"].is_null() ? 0 : fixture["goals"]["home"].get<int>();
-
-                    match["away"]["name"] = fixture["teams"]["away"].value("name", "");
-                    match["away"]["longName"] = fixture["teams"]["away"].value("name", "");
-                    match["away"]["score"] = fixture["goals"]["away"].is_null() ? 0 : fixture["goals"]["away"].get<int>();
-
-                    // Status
-                    std::string status = fixture["fixture"]["status"].value("short", "");
-                    if (status == "1H" || status == "2H" || status == "HT" || status == "LIVE") {
-                        match["statusId"] = 2;  // Live
-                    }
-                    else if (status == "FT" || status == "AET" || status == "PEN") {
-                        match["statusId"] = 6;  // Finished
-                    }
-                    else {
-                        match["statusId"] = 1;  // Scheduled
-                    }
-
-                    match["status_text"] = status;
-                    match["leagueId"] = fixture["league"].value("id", 0);
-                    match["leagueName"] = fixture["league"].value("name", "");
-                    match["fetch_date"] = label;
-
-                    fixtures.push_back(match);
-                    count++;
+            auto data = json::parse(tomorrowResponse.text);
+            if (data.contains("matches") && data["matches"].is_array()) {
+                for (auto& match : data["matches"]) {
+                    allFixtures["data"].push_back(formatMatch(match, "tomorrow"));
                 }
-                std::cout << "   ✅ Found " << count << " fixtures" << std::endl;
+                std::cout << "   ✅ " << data["matches"].size() << " matches" << std::endl;
             }
         }
         catch (const std::exception& e) {
-            std::cerr << "   ❌ Parse error: " << e.what() << std::endl;
+            std::cerr << "   ❌ Error: " << e.what() << std::endl;
         }
     }
     else {
-        std::cerr << "   ❌ API Error: " << response.status_code << std::endl;
+        std::cerr << "   ❌ HTTP " << tomorrowResponse.status_code << std::endl;
     }
 
-    return fixtures;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cached_fixtures = allFixtures;
+        last_fixture_fetch = now;
+    }
+
+    std::cout << "✅ Fixture cache refreshed: " << allFixtures["data"].size() << " total matches" << std::endl;
 }
 
-void fetchAllMatches(const std::string& apiKey) {
+// Smart update loop
+void smartUpdateLoop(const std::string& apiKey) {
     // Initialize
-    last_reset = std::chrono::system_clock::now();
-    last_fixture_fetch = std::chrono::system_clock::now() - std::chrono::hours(7); // Force initial fetch
+    last_fixture_fetch = std::chrono::system_clock::now() - std::chrono::hours(3);
 
     while (true) {
         std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
-        std::cout << "⚽ REALSSA ENGINE: API-FOOTBALL (SMART CACHING)" << std::endl;
+        std::cout << "⚽ REALSSA SMART ENGINE" << std::endl;
         std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
 
-        json allMatches;
-        allMatches["data"] = json::array();
-        allMatches["status"] = "success";
+        // Refresh fixture cache (only if needed - every 2 hours)
+        refreshFixtureCache(apiKey);
 
+        // Build response from cache
+        json response;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            response = cached_fixtures;
+        }
+
+        // Add metadata
         auto now = std::chrono::system_clock::now();
         auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
             now.time_since_epoch()
         ).count();
-        allMatches["server_timestamp"] = timestamp;
-        allMatches["server"] = "Realssa C++ Engine";
 
-        // Get today and tomorrow dates
-        DateInfo today = getDateWithOffset(0);
-        DateInfo tomorrow = getDateWithOffset(1);
+        response["status"] = "success";
+        response["server_timestamp"] = timestamp;
+        response["server"] = "Realssa Smart Engine";
+        response["provider"] = "football-data.org";
+        response["today"] = getTodayDate();
+        response["tomorrow"] = getDateWithOffset(1);
+        response["total_matches"] = response["data"].size();
 
-        allMatches["today"] = today.display;
-        allMatches["tomorrow"] = tomorrow.display;
+        // Count live matches
+        int liveCount = 0;
+        int finishedCount = 0;
+        int upcomingCount = 0;
 
-        std::cout << "📅 Today: " << today.display << std::endl;
-        std::cout << "📅 Tomorrow: " << tomorrow.display << std::endl;
-
-        std::set<int> seenMatchIds;
-
-        // Check if we need to refresh fixtures (every 6 hours)
-        auto hours_since_fixture_fetch = std::chrono::duration_cast<std::chrono::hours>(
-            now - last_fixture_fetch
-        ).count();
-
-        bool should_fetch_fixtures = hours_since_fixture_fetch >= FIXTURE_CACHE_HOURS;
-
-        if (should_fetch_fixtures) {
-            std::cout << "\n🔄 Refreshing fixture cache (last fetch: " << hours_since_fixture_fetch << "h ago)" << std::endl;
-
-            // Fetch today's fixtures (1 request)
-            json todayFixtures = fetchFixturesForDate(apiKey, today.display, "today");
-            for (auto& match : todayFixtures) {
-                int matchId = match["id"].get<int>();
-                if (seenMatchIds.find(matchId) == seenMatchIds.end()) {
-                    allMatches["data"].push_back(match);
-                    seenMatchIds.insert(matchId);
-                }
+        for (auto& match : response["data"]) {
+            if (match.value("is_live", false)) {
+                liveCount++;
             }
-
-            // Small delay between requests
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-
-            // Fetch tomorrow's fixtures (1 request)
-            json tomorrowFixtures = fetchFixturesForDate(apiKey, tomorrow.display, "tomorrow");
-            for (auto& match : tomorrowFixtures) {
-                int matchId = match["id"].get<int>();
-                if (seenMatchIds.find(matchId) == seenMatchIds.end()) {
-                    allMatches["data"].push_back(match);
-                    seenMatchIds.insert(matchId);
-                }
+            else if (match.value("statusId", 0) == 6) {
+                finishedCount++;
             }
-
-            last_fixture_fetch = now;
-        }
-        else {
-            std::cout << "\n💾 Using cached fixtures (next refresh in "
-                << (FIXTURE_CACHE_HOURS - hours_since_fixture_fetch) << "h)" << std::endl;
-            std::cout << "   (Saves API quota - still showing live updates)" << std::endl;
-        }
-
-        // Small delay
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-
-        // ALWAYS fetch live matches (1 request every 3 minutes)
-        json liveMatches = fetchLiveMatches(apiKey);
-
-        // Update live matches or add them
-        std::map<int, size_t> matchPositions;
-        for (size_t i = 0; i < allMatches["data"].size(); i++) {
-            auto& match = allMatches["data"][i];
-            if (match.contains("id")) {
-                matchPositions[match["id"].get<int>()] = i;
+            else {
+                upcomingCount++;
             }
         }
 
-        for (auto& liveMatch : liveMatches) {
-            int matchId = liveMatch["id"].get<int>();
-            if (matchPositions.find(matchId) != matchPositions.end()) {
-                // Update existing match
-                allMatches["data"][matchPositions[matchId]] = liveMatch;
-            }
-            else if (seenMatchIds.find(matchId) == seenMatchIds.end()) {
-                // Add new match
-                allMatches["data"].push_back(liveMatch);
-                seenMatchIds.insert(matchId);
-            }
-        }
+        response["live_matches"] = liveCount;
+        response["finished_matches"] = finishedCount;
+        response["upcoming_matches"] = upcomingCount;
+        response["api_calls_today"] = api_calls_today;
 
-        // Save data
+        // Save to global
         {
             std::lock_guard<std::mutex> lock(data_mutex);
-            allMatches["total_matches"] = allMatches["data"].size();
-            allMatches["last_updated"] = timestamp;
-            allMatches["api_calls_today"] = request_count;
-            allMatches["quota_remaining"] = daily_limit - request_count;
-            latest_match_data = allMatches.dump();
+            latest_match_data = response.dump();
         }
 
-        std::cout << "\n✅ TOTAL MATCHES: " << allMatches["data"].size() << std::endl;
-        std::cout << "📊 API Quota: " << request_count << "/" << daily_limit
-            << " (" << (daily_limit - request_count) << " remaining)" << std::endl;
+        std::cout << "\n📊 SUMMARY:" << std::endl;
+        std::cout << "   🔴 Live: " << liveCount << std::endl;
+        std::cout << "   ✅ Finished: " << finishedCount << std::endl;
+        std::cout << "   ⏰ Upcoming: " << upcomingCount << std::endl;
+        std::cout << "   📊 Total: " << response["data"].size() << std::endl;
+        std::cout << "   📞 API Calls Today: " << api_calls_today << std::endl;
         std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
 
-        // Update every 3 minutes (20 requests/hour = 480/day, but we cache fixtures)
-        // Actual usage: ~2 requests per cycle (only live matches after first fetch)
-        // = ~16 requests/hour = ~384/day (well under 100 due to caching!)
-        std::cout << "⏳ Next update in 3 minutes...\n" << std::endl;
-        std::this_thread::sleep_for(std::chrono::minutes(3));
+        // Smart polling:
+        // - If there are live matches: update every 5 minutes
+        // - If no live matches: update every 30 minutes
+        int waitMinutes = (liveCount > 0) ? 5 : 30;
+
+        std::cout << "⏳ Next update in " << waitMinutes << " minutes";
+        if (liveCount > 0) {
+            std::cout << " (LIVE MATCHES DETECTED - Fast polling)";
+        }
+        std::cout << "\n" << std::endl;
+
+        std::this_thread::sleep_for(std::chrono::minutes(waitMinutes));
     }
 }
 
 int main() {
     std::cout << R"(
     ╔═══════════════════════════════════════╗
-    ║   Realssa Football - C++ Engine      ║
-    ║   API-Football with Smart Caching    ║
+    ║   Realssa Smart Football Engine      ║
+    ║   Powered by football-data.org       ║
+    ║   🚀 Intelligent Caching System      ║
     ╚═══════════════════════════════════════╝
     )" << std::endl;
 
-    const char* envKey = std::getenv("API_FOOTBALL_KEY");
+    const char* envKey = std::getenv("FOOTBALL_DATA_KEY");
     std::string myKey = envKey ? envKey : "";
 
     if (myKey.empty()) {
-        std::cerr << "❌ ERROR: API_FOOTBALL_KEY environment variable not set!" << std::endl;
-        std::cerr << "   Please set your API-Football key in Railway." << std::endl;
+        std::cerr << "❌ ERROR: FOOTBALL_DATA_KEY environment variable not set!" << std::endl;
         return 1;
     }
 
-    std::cout << "✅ API Key loaded: " << myKey.substr(0, 8) << "..." << std::endl;
-    std::cout << "🔄 Smart caching enabled (6h fixture cache)" << std::endl;
-    std::cout << "📊 Daily quota: 95 requests (100 with buffer)" << std::endl;
-    std::cout << "⏱️  Live matches update every 3 minutes" << std::endl;
-    std::cout << "💾 Fixtures cached for 6 hours" << std::endl;
+    std::cout << "✅ API Key: " << myKey.substr(0, 8) << "..." << std::endl;
+    std::cout << "🌐 Provider: football-data.org" << std::endl;
+    std::cout << "💾 Smart Caching: Fixtures cached for 2 hours" << std::endl;
+    std::cout << "⚡ Dynamic Polling: 5min when live, 30min otherwise" << std::endl;
+    std::cout << "📊 Est. Daily Calls: 10-50 (depending on live matches)" << std::endl;
 
     // Start background sync
-    std::thread worker(fetchAllMatches, myKey);
+    std::thread worker(smartUpdateLoop, myKey);
     worker.detach();
 
     // Start API Server
     httplib::Server svr;
 
-    // CORS
     svr.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -410,29 +367,30 @@ int main() {
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_content("⚽ Realssa - API-Football with Smart Caching!", "text/plain");
+        res.set_content("⚽ Realssa Smart Football Engine - Powered by football-data.org!", "text/plain");
         });
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         json health;
         health["status"] = "online";
-        health["engine"] = "Realssa C++ Football Engine";
-        health["version"] = "5.0.0 - Smart Cache";
-        health["api_provider"] = "api-football.com";
-        health["features"] = { "smart_caching", "live_updates", "global_coverage", "quota_management" };
+        health["engine"] = "Realssa Smart Football Engine";
+        health["version"] = "7.0.0 - Smart Cache";
+        health["api_provider"] = "football-data.org";
+        health["features"] = {
+            "smart_caching",
+            "dynamic_polling",
+            "live_detection",
+            "auto_date_rotation"
+        };
 
         auto now = std::chrono::system_clock::now();
         auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
             now.time_since_epoch()
         ).count();
         health["server_time"] = timestamp;
-        health["api_calls_today"] = request_count;
-        health["quota_remaining"] = daily_limit - request_count;
-
-        DateInfo today = getDateWithOffset(0);
-        DateInfo tomorrow = getDateWithOffset(1);
-        health["today"] = today.display;
-        health["tomorrow"] = tomorrow.display;
+        health["today"] = getTodayDate();
+        health["tomorrow"] = getDateWithOffset(1);
+        health["api_calls_today"] = api_calls_today;
 
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Content-Type", "application/json");
@@ -441,9 +399,10 @@ int main() {
 
     std::cout << "\n🚀 Server running on Port 8080..." << std::endl;
     std::cout << "📡 Endpoints:" << std::endl;
-    std::cout << "   GET /scores   - All matches (cached + live updates)" << std::endl;
-    std::cout << "   GET /health   - Server status + quota info" << std::endl;
-    std::cout << "\n✨ Smart caching keeps you under 100 requests/day!\n" << std::endl;
+    std::cout << "   GET /         - Health check" << std::endl;
+    std::cout << "   GET /scores   - All matches with smart updates" << std::endl;
+    std::cout << "   GET /health   - Server status + API usage" << std::endl;
+    std::cout << "\n✨ Smart engine ready!\n" << std::endl;
 
     svr.listen("0.0.0.0", 8080);
 
