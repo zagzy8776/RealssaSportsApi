@@ -1,47 +1,36 @@
-﻿#include <iostream>
+﻿#include <crow.h>
+#include <nlohmann/json.hpp>
+#include <cpr/cpr.h>
+#include <iostream>
 #include <string>
 #include <vector>
-#include <thread>
 #include <chrono>
+#include <thread>
 #include <mutex>
-#include <map>
-#include <set>
-#include <cpr/cpr.h>
-#include <nlohmann/json.hpp>
-#include <httplib.h>
+#include <ctime>
 
 using json = nlohmann::json;
 
-// Global thread-safe data
-std::string latest_match_data = "{\"status\": \"initializing\"}";
-std::mutex data_mutex;
+// QUOTA PROTECTION - CRITICAL SETTINGS
+const int MAX_API_CALLS_PER_DAY = 450;  // Safety limit (out of 500 free tier)
+const int CACHE_DURATION_HOURS = 3;      // Cache data for 3 hours minimum
+const int POLL_INTERVAL_NO_LIVE = 60;    // 60 minutes when no live matches
+const int POLL_INTERVAL_WITH_LIVE = 10;  // 10 minutes when live matches exist
 
-// Cached fixture data (refreshed less frequently)
+// Global state
 json cached_fixtures;
 std::chrono::system_clock::time_point last_fixture_fetch;
 std::mutex cache_mutex;
-
-// Request counter
-int api_calls_today = 0;
 std::mutex counter_mutex;
+int api_calls_today = 0;
+int live_match_count = 0;
+std::chrono::system_clock::time_point last_reset_date;
 
-// Priority leagues (to reduce API calls)
-const std::vector<std::string> PRIORITY_LEAGUES = {
-    "PL",   // Premier League
-    "PD",   // La Liga
-    "SA",   // Serie A
-    "BL1",  // Bundesliga
-    "FL1",  // Ligue 1
-    "CL",   // Champions League
-    "WC",   // World Cup
-    "EC"    // European Championship
-};
-
-// Function to get current date in YYYY-MM-DD format (Cross-platform)
+// Cross-platform date handling
 std::string getTodayDate() {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    struct tm timeinfo;
+    std::tm timeinfo;
 
 #ifdef _WIN32
     localtime_s(&timeinfo, &now_time);
@@ -50,108 +39,180 @@ std::string getTodayDate() {
 #endif
 
     char buffer[11];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
     return std::string(buffer);
 }
 
-// Get date with offset
-std::string getDateWithOffset(int dayOffset) {
+// Check if we need to reset daily counter
+void checkAndResetDailyCounter() {
     auto now = std::chrono::system_clock::now();
-    auto target = now + std::chrono::hours(24 * dayOffset);
-    std::time_t target_time = std::chrono::system_clock::to_time_t(target);
-    struct tm timeinfo;
+    auto hours_diff = std::chrono::duration_cast<std::chrono::hours>(
+        now - last_reset_date
+    ).count();
 
-#ifdef _WIN32
-    localtime_s(&timeinfo, &target_time);
-#else
-    localtime_r(&target_time, &timeinfo);
-#endif
-
-    char buffer[11];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
-    return std::string(buffer);
+    if (hours_diff >= 24) {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        api_calls_today = 0;
+        last_reset_date = now;
+        std::cout << "\n🔄 Daily API counter reset!" << std::endl;
+    }
 }
 
-// Format match data from API
-json formatMatch(const json& match, const std::string& dateLabel = "") {
-    json formattedMatch;
-
-    formattedMatch["id"] = match.value("id", 0);
-    formattedMatch["time"] = match.value("utcDate", "");
-
-    // Teams
-    formattedMatch["home"]["name"] = match["homeTeam"].value("name", "");
-    formattedMatch["home"]["shortName"] = match["homeTeam"].value("shortName", "");
-    formattedMatch["home"]["tla"] = match["homeTeam"].value("tla", "");
-    formattedMatch["home"]["crest"] = match["homeTeam"].value("crest", "");
-
-    formattedMatch["away"]["name"] = match["awayTeam"].value("name", "");
-    formattedMatch["away"]["shortName"] = match["awayTeam"].value("shortName", "");
-    formattedMatch["away"]["tla"] = match["awayTeam"].value("tla", "");
-    formattedMatch["away"]["crest"] = match["awayTeam"].value("crest", "");
-
-    // Scores
-    if (match.contains("score") && match["score"].contains("fullTime")) {
-        formattedMatch["home"]["score"] = match["score"]["fullTime"]["home"].is_null() ? 0 : match["score"]["fullTime"]["home"].get<int>();
-        formattedMatch["away"]["score"] = match["score"]["fullTime"]["away"].is_null() ? 0 : match["score"]["fullTime"]["away"].get<int>();
+// Check if we can make an API call (QUOTA PROTECTION)
+bool canMakeApiCall() {
+    std::lock_guard<std::mutex> lock(counter_mutex);
+    if (api_calls_today >= MAX_API_CALLS_PER_DAY) {
+        std::cerr << "\n⚠️  QUOTA LIMIT REACHED! (" << api_calls_today << "/" << MAX_API_CALLS_PER_DAY << ")" << std::endl;
+        std::cerr << "⏸️  Skipping API call to protect quota" << std::endl;
+        return false;
     }
-    else {
-        formattedMatch["home"]["score"] = 0;
-        formattedMatch["away"]["score"] = 0;
-    }
-
-    // Half-time score
-    if (match.contains("score") && match["score"].contains("halfTime")) {
-        formattedMatch["halftime"]["home"] = match["score"]["halfTime"]["home"].is_null() ? 0 : match["score"]["halfTime"]["home"].get<int>();
-        formattedMatch["halftime"]["away"] = match["score"]["halfTime"]["away"].is_null() ? 0 : match["score"]["halfTime"]["away"].get<int>();
-    }
-
-    // Status
-    std::string status = match.value("status", "SCHEDULED");
-    formattedMatch["status"] = status;
-    formattedMatch["status_text"] = status;
-
-    if (status == "IN_PLAY" || status == "PAUSED") {
-        formattedMatch["statusId"] = 2; // Live
-        formattedMatch["is_live"] = true;
-    }
-    else if (status == "FINISHED") {
-        formattedMatch["statusId"] = 6; // Finished
-        formattedMatch["is_live"] = false;
-    }
-    else {
-        formattedMatch["statusId"] = 1; // Scheduled
-        formattedMatch["is_live"] = false;
-    }
-
-    // Competition/League
-    if (match.contains("competition")) {
-        formattedMatch["leagueId"] = match["competition"].value("id", 0);
-        formattedMatch["leagueName"] = match["competition"].value("name", "");
-        formattedMatch["leagueCode"] = match["competition"].value("code", "");
-        formattedMatch["leagueEmblem"] = match["competition"].value("emblem", "");
-    }
-
-    formattedMatch["matchday"] = match.value("matchday", 0);
-    formattedMatch["venue"] = match.value("venue", "");
-
-    if (!dateLabel.empty()) {
-        formattedMatch["date_label"] = dateLabel;
-    }
-
-    return formattedMatch;
+    return true;
 }
 
-// Fetch all fixtures (cached for 2 hours)
+// Helper function to make RapidAPI requests with quota protection
+cpr::Response makeRapidApiRequest(const std::string& endpoint, const std::string& apiKey) {
+    if (!canMakeApiCall()) {
+        // Return empty response if quota exceeded
+        return cpr::Response{};
+    }
+
+    auto response = cpr::Get(
+        cpr::Url{ "https://sportapi7.p.rapidapi.com" + endpoint },
+        cpr::Header{
+            {"x-rapidapi-host", "sportapi7.p.rapidapi.com"},
+            {"x-rapidapi-key", apiKey}
+        },
+        cpr::Timeout{ 10000 }  // 10 second timeout
+    );
+
+    // Only increment if we got a response
+    if (response.status_code != 0) {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        api_calls_today++;
+        std::cout << "   📊 API Calls: " << api_calls_today << "/" << MAX_API_CALLS_PER_DAY << std::endl;
+    }
+
+    return response;
+}
+
+// Format match data from SportAPI7 response
+json formatMatch(const json& event, const std::string& dateLabel) {
+    json match;
+
+    try {
+        // Extract basic info
+        match["id"] = event.value("id", 0);
+        match["date"] = dateLabel;
+
+        // Teams
+        if (event.contains("homeTeam") && event["homeTeam"].is_object()) {
+            match["home_team"] = event["homeTeam"].value("name", "Unknown");
+            if (event["homeTeam"].contains("id")) {
+                match["home_team_logo"] = "https://img.sofascore.com/api/v1/team/" +
+                    std::to_string(event["homeTeam"]["id"].get<int>()) + "/image";
+            }
+        }
+
+        if (event.contains("awayTeam") && event["awayTeam"].is_object()) {
+            match["away_team"] = event["awayTeam"].value("name", "Unknown");
+            if (event["awayTeam"].contains("id")) {
+                match["away_team_logo"] = "https://img.sofascore.com/api/v1/team/" +
+                    std::to_string(event["awayTeam"]["id"].get<int>()) + "/image";
+            }
+        }
+
+        // Score
+        if (event.contains("homeScore") && event["homeScore"].is_object()) {
+            match["home_score"] = event["homeScore"].value("current", 0);
+            match["home_score_ht"] = event["homeScore"].value("period1", 0);
+        }
+        else {
+            match["home_score"] = 0;
+        }
+
+        if (event.contains("awayScore") && event["awayScore"].is_object()) {
+            match["away_score"] = event["awayScore"].value("current", 0);
+            match["away_score_ht"] = event["awayScore"].value("period1", 0);
+        }
+        else {
+            match["away_score"] = 0;
+        }
+
+        // Status
+        if (event.contains("status") && event["status"].is_object()) {
+            int statusCode = event["status"].value("code", 0);
+            std::string statusType = event["status"].value("type", "");
+
+            // Map status codes
+            if (statusCode == 100 || statusType == "inprogress") {
+                match["statusId"] = 2; // Live
+                match["statusName"] = "LIVE";
+            }
+            else if (statusCode == 120 || statusCode == 110 || statusType == "finished") {
+                match["statusId"] = 6; // Finished
+                match["statusName"] = "FT";
+            }
+            else if (statusCode == 31) {
+                match["statusId"] = 2;
+                match["statusName"] = "HT"; // Half Time
+            }
+            else {
+                match["statusId"] = 1; // Scheduled
+                match["statusName"] = "VS";
+            }
+
+            // Add time info
+            if (event["status"].contains("description")) {
+                match["time"] = event["status"]["description"];
+            }
+        }
+        else {
+            match["statusId"] = 1;
+            match["statusName"] = "VS";
+        }
+
+        // League info
+        if (event.contains("tournament") && event["tournament"].is_object()) {
+            match["league"] = event["tournament"].value("name", "");
+            match["league_country"] = event["tournament"].value("category", json::object()).value("name", "");
+            if (event["tournament"].contains("id")) {
+                match["league_logo"] = "https://img.sofascore.com/api/v1/unique-tournament/" +
+                    std::to_string(event["tournament"]["id"].get<int>()) + "/image";
+            }
+        }
+
+        // Start time (Unix timestamp)
+        if (event.contains("startTimestamp")) {
+            match["timestamp"] = event["startTimestamp"];
+        }
+
+    }
+    catch (const std::exception& e) {
+        std::cerr << "⚠️  Error formatting match: " << e.what() << std::endl;
+    }
+
+    return match;
+}
+
+// Refresh fixture cache - ULTRA CONSERVATIVE VERSION
 void refreshFixtureCache(const std::string& apiKey) {
+    checkAndResetDailyCounter();
+
     auto now = std::chrono::system_clock::now();
     auto hours_since_fetch = std::chrono::duration_cast<std::chrono::hours>(
         now - last_fixture_fetch
     ).count();
 
-    // Only refresh if 2+ hours have passed
-    if (hours_since_fetch < 2 && !cached_fixtures.empty()) {
-        std::cout << "💾 Using cached fixtures (last fetch: " << hours_since_fetch << "h ago)" << std::endl;
+    // STRICT CACHING: Only refresh if cache is old enough
+    if (hours_since_fetch < CACHE_DURATION_HOURS && !cached_fixtures.empty()) {
+        std::cout << "💾 Using cached fixtures (last fetch: " << hours_since_fetch << "h ago, expires in "
+            << (CACHE_DURATION_HOURS - hours_since_fetch) << "h)" << std::endl;
+        return;
+    }
+
+    // QUOTA CHECK before fetching
+    if (!canMakeApiCall()) {
+        std::cout << "⏸️  Skipping cache refresh - quota protection active" << std::endl;
         return;
     }
 
@@ -161,70 +222,66 @@ void refreshFixtureCache(const std::string& apiKey) {
     allFixtures["data"] = json::array();
 
     std::string today = getTodayDate();
-    std::string tomorrow = getDateWithOffset(1);
 
-    // Fetch today's fixtures
-    std::cout << "📡 Fetching today's fixtures (" << today << ")..." << std::endl;
-    auto todayResponse = cpr::Get(
-        cpr::Url{ "https://api.football-data.org/v4/matches" },
-        cpr::Header{ {"X-Auth-Token", apiKey} },
-        cpr::Parameters{ {"dateFrom", today}, {"dateTo", today} }
-    );
+    // ENDPOINT 1: Live Events (MOST IMPORTANT)
+    std::cout << "📡 Fetching LIVE events..." << std::endl;
+    auto liveResponse = makeRapidApiRequest("/api/v1/sport/football/events/live", apiKey);
 
-    {
-        std::lock_guard<std::mutex> lock(counter_mutex);
-        api_calls_today++;
-    }
-
-    if (todayResponse.status_code == 200) {
+    if (liveResponse.status_code == 200) {
         try {
-            auto data = json::parse(todayResponse.text);
-            if (data.contains("matches") && data["matches"].is_array()) {
-                for (auto& match : data["matches"]) {
-                    allFixtures["data"].push_back(formatMatch(match, "today"));
+            auto data = json::parse(liveResponse.text);
+
+            if (data.contains("events") && data["events"].is_array()) {
+                std::cout << "   ✅ Found " << data["events"].size() << " live matches" << std::endl;
+
+                for (auto& event : data["events"]) {
+                    allFixtures["data"].push_back(formatMatch(event, "live"));
                 }
-                std::cout << "   ✅ " << data["matches"].size() << " matches" << std::endl;
+            }
+            else {
+                std::cout << "   ℹ️  No live matches" << std::endl;
             }
         }
         catch (const std::exception& e) {
-            std::cerr << "   ❌ Error: " << e.what() << std::endl;
+            std::cerr << "   ❌ Parse error: " << e.what() << std::endl;
         }
     }
-    else {
-        std::cerr << "   ❌ HTTP " << todayResponse.status_code << std::endl;
+    else if (liveResponse.status_code == 403) {
+        std::cerr << "   ❌ Invalid API Key!" << std::endl;
+    }
+    else if (liveResponse.status_code == 429) {
+        std::cerr << "   ❌ RATE LIMIT HIT - Stopping all requests!" << std::endl;
+        api_calls_today = MAX_API_CALLS_PER_DAY; // Block further calls
+        return;
     }
 
+    // Small delay between requests
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // Fetch tomorrow's fixtures
-    std::cout << "📡 Fetching tomorrow's fixtures (" << tomorrow << ")..." << std::endl;
-    auto tomorrowResponse = cpr::Get(
-        cpr::Url{ "https://api.football-data.org/v4/matches" },
-        cpr::Header{ {"X-Auth-Token", apiKey} },
-        cpr::Parameters{ {"dateFrom", tomorrow}, {"dateTo", tomorrow} }
-    );
+    // ENDPOINT 2: Scheduled Events for Today (ONLY if we have quota left)
+    if (canMakeApiCall()) {
+        std::cout << "📡 Fetching scheduled events for today..." << std::endl;
+        auto scheduledResponse = makeRapidApiRequest(
+            "/api/v1/sport/football/scheduled-events/" + today,
+            apiKey
+        );
 
-    {
-        std::lock_guard<std::mutex> lock(counter_mutex);
-        api_calls_today++;
-    }
+        if (scheduledResponse.status_code == 200) {
+            try {
+                auto data = json::parse(scheduledResponse.text);
 
-    if (tomorrowResponse.status_code == 200) {
-        try {
-            auto data = json::parse(tomorrowResponse.text);
-            if (data.contains("matches") && data["matches"].is_array()) {
-                for (auto& match : data["matches"]) {
-                    allFixtures["data"].push_back(formatMatch(match, "tomorrow"));
+                if (data.contains("events") && data["events"].is_array()) {
+                    std::cout << "   ✅ Found " << data["events"].size() << " scheduled matches" << std::endl;
+
+                    for (auto& event : data["events"]) {
+                        allFixtures["data"].push_back(formatMatch(event, "today"));
+                    }
                 }
-                std::cout << "   ✅ " << data["matches"].size() << " matches" << std::endl;
+            }
+            catch (const std::exception& e) {
+                std::cerr << "   ❌ Parse error: " << e.what() << std::endl;
             }
         }
-        catch (const std::exception& e) {
-            std::cerr << "   ❌ Error: " << e.what() << std::endl;
-        }
-    }
-    else {
-        std::cerr << "   ❌ HTTP " << tomorrowResponse.status_code << std::endl;
     }
 
     {
@@ -233,23 +290,102 @@ void refreshFixtureCache(const std::string& apiKey) {
         last_fixture_fetch = now;
     }
 
-    std::cout << "✅ Fixture cache refreshed: " << allFixtures["data"].size() << " total matches" << std::endl;
+    std::cout << "✅ Cache refreshed: " << allFixtures["data"].size() << " total matches" << std::endl;
+    std::cout << "💾 Next refresh in " << CACHE_DURATION_HOURS << " hours" << std::endl;
 }
 
-// Smart update loop
-void smartUpdateLoop(const std::string& apiKey) {
-    // Initialize
-    last_fixture_fetch = std::chrono::system_clock::now() - std::chrono::hours(3);
+// Count live matches
+int countLiveMatches() {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    int count = 0;
 
+    if (cached_fixtures.contains("data") && cached_fixtures["data"].is_array()) {
+        for (const auto& match : cached_fixtures["data"]) {
+            if (match.contains("statusId") && match["statusId"] == 2) {
+                count++;
+            }
+        }
+    }
+
+    return count;
+}
+
+// Background polling thread - ULTRA CONSERVATIVE
+void backgroundPoller(const std::string& apiKey) {
     while (true) {
-        std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
-        std::cout << "⚽ REALSSA SMART ENGINE" << std::endl;
-        std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
-
-        // Refresh fixture cache (only if needed - every 2 hours)
         refreshFixtureCache(apiKey);
 
-        // Build response from cache
+        int liveMatches = countLiveMatches();
+
+        {
+            std::lock_guard<std::mutex> lock(counter_mutex);
+            live_match_count = liveMatches;
+        }
+
+        // CONSERVATIVE POLLING: Long intervals to protect quota
+        int pollInterval = (liveMatches > 0) ? POLL_INTERVAL_WITH_LIVE : POLL_INTERVAL_NO_LIVE;
+
+        std::cout << "\n📊 Quota Status:" << std::endl;
+        std::cout << "   API Calls: " << api_calls_today << "/" << MAX_API_CALLS_PER_DAY << std::endl;
+        std::cout << "   Live Matches: " << liveMatches << std::endl;
+        std::cout << "   ⏳ Next poll: " << pollInterval << " minutes" << std::endl;
+
+        std::this_thread::sleep_for(std::chrono::minutes(pollInterval));
+    }
+}
+
+int main() {
+    crow::SimpleApp app;
+
+    // Get API key from environment
+    const char* api_key_env = std::getenv("RAPIDAPI_KEY");
+    if (!api_key_env) {
+        std::cerr << "❌ ERROR: RAPIDAPI_KEY environment variable not set!" << std::endl;
+        return 1;
+    }
+
+    std::string api_key = api_key_env;
+    std::cout << "✅ API Key: " << api_key.substr(0, 10) << "..." << std::endl;
+
+    // Initialize cache and counters
+    cached_fixtures["data"] = json::array();
+    last_fixture_fetch = std::chrono::system_clock::now() - std::chrono::hours(CACHE_DURATION_HOURS + 1);
+    last_reset_date = std::chrono::system_clock::now();
+
+    std::cout << "\n⚡ QUOTA PROTECTION ACTIVE" << std::endl;
+    std::cout << "   Max API Calls: " << MAX_API_CALLS_PER_DAY << "/day" << std::endl;
+    std::cout << "   Cache Duration: " << CACHE_DURATION_HOURS << " hours" << std::endl;
+    std::cout << "   Poll Interval (No Live): " << POLL_INTERVAL_NO_LIVE << " min" << std::endl;
+    std::cout << "   Poll Interval (Live): " << POLL_INTERVAL_WITH_LIVE << " min" << std::endl;
+
+    // Start background polling
+    std::thread poller(backgroundPoller, api_key);
+    poller.detach();
+
+    // Health check endpoint
+    CROW_ROUTE(app, "/")
+        ([]() {
+        crow::response res;
+        res.set_header("Content-Type", "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.write("{\n  \"message\": \"RealSSA Sports API - Quota Protected\",\n  \"status\": \"online\",\n  \"version\": \"9.0.0 - Ultra Safe\"\n}");
+        return res;
+            });
+
+    // Scores endpoint
+    CROW_ROUTE(app, "/scores")
+        ([&api_key]() {
+        // Check if cache needs refresh (but respect quota limits)
+        auto now = std::chrono::system_clock::now();
+        auto hours_since = std::chrono::duration_cast<std::chrono::hours>(
+            now - last_fixture_fetch
+        ).count();
+
+        // Only force refresh if cache is VERY old and we have quota
+        if (hours_since >= CACHE_DURATION_HOURS && canMakeApiCall()) {
+            refreshFixtureCache(api_key);
+        }
+
         json response;
         {
             std::lock_guard<std::mutex> lock(cache_mutex);
@@ -257,154 +393,67 @@ void smartUpdateLoop(const std::string& apiKey) {
         }
 
         // Add metadata
-        auto now = std::chrono::system_clock::now();
-        auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            now.time_since_epoch()
-        ).count();
-
-        response["status"] = "success";
-        response["server_timestamp"] = timestamp;
-        response["server"] = "Realssa Smart Engine";
-        response["provider"] = "football-data.org";
-        response["today"] = getTodayDate();
-        response["tomorrow"] = getDateWithOffset(1);
-        response["total_matches"] = response["data"].size();
-
-        // Count live matches
-        int liveCount = 0;
-        int finishedCount = 0;
-        int upcomingCount = 0;
-
-        for (auto& match : response["data"]) {
-            if (match.value("is_live", false)) {
-                liveCount++;
-            }
-            else if (match.value("statusId", 0) == 6) {
-                finishedCount++;
-            }
-            else {
-                upcomingCount++;
-            }
-        }
-
-        response["live_matches"] = liveCount;
-        response["finished_matches"] = finishedCount;
-        response["upcoming_matches"] = upcomingCount;
-        response["api_calls_today"] = api_calls_today;
-
-        // Save to global
-        {
-            std::lock_guard<std::mutex> lock(data_mutex);
-            latest_match_data = response.dump();
-        }
-
-        std::cout << "\n📊 SUMMARY:" << std::endl;
-        std::cout << "   🔴 Live: " << liveCount << std::endl;
-        std::cout << "   ✅ Finished: " << finishedCount << std::endl;
-        std::cout << "   ⏰ Upcoming: " << upcomingCount << std::endl;
-        std::cout << "   📊 Total: " << response["data"].size() << std::endl;
-        std::cout << "   📞 API Calls Today: " << api_calls_today << std::endl;
-        std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
-
-        // Smart polling:
-        // - If there are live matches: update every 5 minutes
-        // - If no live matches: update every 30 minutes
-        int waitMinutes = (liveCount > 0) ? 5 : 30;
-
-        std::cout << "⏳ Next update in " << waitMinutes << " minutes";
-        if (liveCount > 0) {
-            std::cout << " (LIVE MATCHES DETECTED - Fast polling)";
-        }
-        std::cout << "\n" << std::endl;
-
-        std::this_thread::sleep_for(std::chrono::minutes(waitMinutes));
-    }
-}
-
-int main() {
-    std::cout << R"(
-    ╔═══════════════════════════════════════╗
-    ║   Realssa Smart Football Engine      ║
-    ║   Powered by football-data.org       ║
-    ║   🚀 Intelligent Caching System      ║
-    ╚═══════════════════════════════════════╝
-    )" << std::endl;
-
-    const char* envKey = std::getenv("FOOTBALL_DATA_KEY");
-    std::string myKey = envKey ? envKey : "";
-
-    if (myKey.empty()) {
-        std::cerr << "❌ ERROR: FOOTBALL_DATA_KEY environment variable not set!" << std::endl;
-        return 1;
-    }
-
-    std::cout << "✅ API Key: " << myKey.substr(0, 8) << "..." << std::endl;
-    std::cout << "🌐 Provider: football-data.org" << std::endl;
-    std::cout << "💾 Smart Caching: Fixtures cached for 2 hours" << std::endl;
-    std::cout << "⚡ Dynamic Polling: 5min when live, 30min otherwise" << std::endl;
-    std::cout << "📊 Est. Daily Calls: 10-50 (depending on live matches)" << std::endl;
-
-    // Start background sync
-    std::thread worker(smartUpdateLoop, myKey);
-    worker.detach();
-
-    // Start API Server
-    httplib::Server svr;
-
-    svr.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type");
-        res.status = 204;
-        });
-
-    svr.Get("/scores", [](const httplib::Request&, httplib::Response& res) {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Content-Type", "application/json");
-        res.set_content(latest_match_data, "application/json");
-        });
-
-    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_content("⚽ Realssa Smart Football Engine - Powered by football-data.org!", "text/plain");
-        });
-
-    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        json health;
-        health["status"] = "online";
-        health["engine"] = "Realssa Smart Football Engine";
-        health["version"] = "7.0.0 - Smart Cache";
-        health["api_provider"] = "football-data.org";
-        health["features"] = {
-            "smart_caching",
-            "dynamic_polling",
-            "live_detection",
-            "auto_date_rotation"
+        response["quota_status"] = {
+            {"calls_used", api_calls_today},
+            {"calls_limit", MAX_API_CALLS_PER_DAY},
+            {"calls_remaining", MAX_API_CALLS_PER_DAY - api_calls_today}
         };
 
-        auto now = std::chrono::system_clock::now();
-        auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            now.time_since_epoch()
-        ).count();
-        health["server_time"] = timestamp;
-        health["today"] = getTodayDate();
-        health["tomorrow"] = getDateWithOffset(1);
-        health["api_calls_today"] = api_calls_today;
-
-        res.set_header("Access-Control-Allow-Origin", "*");
+        crow::response res;
         res.set_header("Content-Type", "application/json");
-        res.set_content(health.dump(2), "application/json");
-        });
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.write(response.dump(2));
+        return res;
+            });
 
-    std::cout << "\n🚀 Server running on Port 8080..." << std::endl;
-    std::cout << "📡 Endpoints:" << std::endl;
-    std::cout << "   GET /         - Health check" << std::endl;
-    std::cout << "   GET /scores   - All matches with smart updates" << std::endl;
-    std::cout << "   GET /health   - Server status + API usage" << std::endl;
-    std::cout << "\n✨ Smart engine ready!\n" << std::endl;
+    // Health endpoint with detailed stats
+    CROW_ROUTE(app, "/health")
+        ([]() {
+        json health;
+        health["status"] = "online";
+        health["engine"] = "RealSSA Quota-Protected Engine";
+        health["api_provider"] = "sportapi7.p.rapidapi.com";
+        health["version"] = "9.0.0 - Ultra Safe";
+        health["today"] = getTodayDate();
 
-    svr.listen("0.0.0.0", 8080);
+        // Quota information
+        health["quota"] = {
+            {"calls_today", api_calls_today},
+            {"max_calls_per_day", MAX_API_CALLS_PER_DAY},
+            {"calls_remaining", MAX_API_CALLS_PER_DAY - api_calls_today},
+            {"quota_exhausted", api_calls_today >= MAX_API_CALLS_PER_DAY}
+        };
+
+        // Match stats
+        health["matches"] = {
+            {"live", live_match_count},
+            {"total_cached", cached_fixtures.contains("data") ? cached_fixtures["data"].size() : 0}
+        };
+
+        // System info
+        health["cache"] = {
+            {"duration_hours", CACHE_DURATION_HOURS},
+            {"poll_interval_no_live_min", POLL_INTERVAL_NO_LIVE},
+            {"poll_interval_live_min", POLL_INTERVAL_WITH_LIVE}
+        };
+
+        health["server_time"] = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        health["features"] = { "ultra_conservative_quota", "smart_caching", "dynamic_polling", "auto_quota_reset" };
+
+        crow::response res;
+        res.set_header("Content-Type", "application/json");
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.write(health.dump(2));
+        return res;
+            });
+
+    // Get port from environment or default to 8080
+    const char* port_env = std::getenv("PORT");
+    int port = port_env ? std::stoi(port_env) : 8080;
+
+    std::cout << "\n🚀 Server starting on Port " << port << std::endl;
+
+    app.port(port).multithreaded().run();
 
     return 0;
 }
