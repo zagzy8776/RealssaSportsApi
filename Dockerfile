@@ -12,16 +12,22 @@ RUN git clone https://github.com/Microsoft/vcpkg.git /opt/vcpkg && \
 ENV VCPKG_FORCE_SYSTEM_BINARIES=1
 ENV PATH="/opt/vcpkg:${PATH}"
 
+# Install Crow C++ framework (header-only library)
+RUN git clone https://github.com/CrowCpp/Crow.git /opt/crow
+
 # Copy project files
 WORKDIR /app
 COPY . .
 
-# Install dependencies via vcpkg (Added cpp-httplib)
+# Install dependencies via vcpkg
 RUN /opt/vcpkg/vcpkg install cpr nlohmann-json cpp-httplib
 
 # Build the project
 RUN mkdir -p build && cd build && \
-    cmake .. -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake -G Ninja && \
+    cmake .. \
+    -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+    -DCROW_INCLUDE_DIR=/opt/crow/include \
+    -G Ninja && \
     cmake --build .
 
 # Run the application
