@@ -1,6 +1,3 @@
-Here's the complete updated Dockerfile:
-
-```dockerfile
 FROM debian:12-slim
 
 # Install necessary build tools
@@ -35,6 +32,3 @@ RUN mkdir -p build && cd build && \
 
 # Run the application
 CMD ["./build/RealssaSportsApi"]
-```
-
-Just copy and paste this entire file to replace your current Dockerfile, then commit and push! 🎯
