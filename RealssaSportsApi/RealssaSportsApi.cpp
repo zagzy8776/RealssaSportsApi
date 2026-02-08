@@ -15,12 +15,19 @@ using json = nlohmann::json;
 std::string latest_merged_data = "{\"status\": \"initializing\"}";
 std::mutex data_mutex;
 
-// Function to get current date in YYYY-MM-DD format
+// Function to get current date in YYYY-MM-DD format (Cross-platform)
 std::string getTodayDate() {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
     struct tm timeinfo;
+
+    // Cross-platform: use localtime_r on Linux/Unix, localtime_s on Windows
+#ifdef _WIN32
     localtime_s(&timeinfo, &now_time);
+#else
+    localtime_r(&now_time, &timeinfo);
+#endif
+
     char buffer[11];
     strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
     return std::string(buffer);
@@ -74,18 +81,39 @@ void smartEngineLoop(const std::string& apiKey) {
 
             }
             catch (const std::exception& e) {
-                std::cerr << "Merger Error: " << e.what() << std::endl;
+                std::cerr << "❌ Merger Error: " << e.what() << std::endl;
             }
+        }
+        else {
+            std::cerr << "❌ API Error - Schedule: " << scheduleRes.status_code
+                << " | Live: " << liveRes.status_code << std::endl;
         }
 
         // Poll every 5 minutes (Safe for free tier limits)
+        std::cout << "⏳ Waiting 5 minutes for next update..." << std::endl;
         std::this_thread::sleep_for(std::chrono::minutes(5));
     }
 }
 
 int main() {
+    std::cout << R"(
+    ╔═══════════════════════════════════════╗
+    ║   Realssa Smart Engine - Football    ║
+    ║   Live Scores & Schedule Tracker     ║
+    ╚═══════════════════════════════════════╝
+    )" << std::endl;
+
     const char* envKey = std::getenv("RAPID_FOOTBALL_KEY");
-    std::string myKey = envKey ? envKey : "e1936a6aa9msh81b9aea3572a9cbp1503fcjsnaee4ac958e8c";
+    std::string myKey = envKey ? envKey : "";
+
+    if (myKey.empty()) {
+        std::cerr << "❌ ERROR: RAPID_FOOTBALL_KEY environment variable not set!" << std::endl;
+        std::cerr << "   Please set your RapidAPI key before running." << std::endl;
+        return 1;
+    }
+
+    std::cout << "✅ API Key loaded successfully" << std::endl;
+    std::cout << "📅 Today's date: " << getTodayDate() << std::endl;
 
     // Start background sync
     std::thread worker(smartEngineLoop, myKey);
@@ -93,13 +121,34 @@ int main() {
 
     // Start API Server for Vercel
     httplib::Server svr;
+
     svr.Get("/scores", [](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(data_mutex);
         res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type");
         res.set_content(latest_merged_data, "application/json");
         });
 
-    std::cout << "Realssa Backend running on Port 8080..." << std::endl;
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content("⚽ Realssa Smart Engine is Online!", "text/plain");
+        });
+
+    // CORS preflight handler
+    svr.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        res.status = 204;
+        });
+
+    std::cout << "🚀 Realssa Backend running on Port 8080..." << std::endl;
+    std::cout << "📡 Endpoints available:" << std::endl;
+    std::cout << "   - GET /         - Health check" << std::endl;
+    std::cout << "   - GET /scores   - Live match data" << std::endl;
+    std::cout << "\n✨ Ready to serve live football scores!\n" << std::endl;
+
     svr.listen("0.0.0.0", 8080);
 
     return 0;
