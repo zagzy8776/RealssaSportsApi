@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <map>
+#include <algorithm>
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <httplib.h>
@@ -32,6 +33,13 @@ std::string getTodayDate() {
     return std::string(buffer);
 }
 
+// Function to convert YYYY-MM-DD to YYYYMMDD
+std::string formatDateForAPI(const std::string& date) {
+    std::string formatted = date;
+    formatted.erase(std::remove(formatted.begin(), formatted.end(), '-'), formatted.end());
+    return formatted;
+}
+
 void fetchAllMatches(const std::string& apiKey) {
     while (true) {
         std::cout << "\n--- ⚽ Realssa Engine: Fetching All Matches ---" << std::endl;
@@ -46,93 +54,139 @@ void fetchAllMatches(const std::string& apiKey) {
         ).count();
         allMatches["server_timestamp"] = timestamp;
         allMatches["server"] = "Realssa C++ Engine";
-        allMatches["date"] = getTodayDate();
 
-        // Try different endpoints to get comprehensive data
+        std::string today = getTodayDate();
+        std::string dateParam = formatDateForAPI(today);
+        allMatches["date"] = today;
 
-        // 1. Get Live Matches
-        std::cout << "📡 Fetching live matches..." << std::endl;
+        std::cout << "📅 Fetching all matches for: " << today << " (API param: " << dateParam << ")" << std::endl;
+
+        // ========== 1. Get ALL matches by date (live, upcoming, finished) ==========
+        std::cout << "📡 Fetching all matches by date..." << std::endl;
+        auto matchesRes = cpr::Get(
+            cpr::Url{ "https://free-api-live-football-data.p.rapidapi.com/football-get-matches-by-date" },
+            cpr::Header{
+                {"x-rapidapi-key", apiKey},
+                {"x-rapidapi-host", "free-api-live-football-data.p.rapidapi.com"}
+            },
+            cpr::Parameters{ {"date", dateParam} }  // Format: YYYYMMDD (e.g., "20260208")
+        );
+
+        if (matchesRes.status_code == 200) {
+            try {
+                auto matchData = json::parse(matchesRes.text);
+
+                if (matchData.contains("data") && matchData["data"].is_array()) {
+                    allMatches["data"] = matchData["data"];
+                    std::cout << "✅ Matches by date: " << matchData["data"].size() << " matches" << std::endl;
+                }
+                else if (matchData.contains("response") && matchData["response"].is_array()) {
+                    allMatches["data"] = matchData["response"];
+                    std::cout << "✅ Matches by date: " << matchData["response"].size() << " matches" << std::endl;
+                }
+                else {
+                    std::cout << "⚠️ No 'data' or 'response' array in matches response" << std::endl;
+                    std::cerr << "   Sample response: " << matchesRes.text.substr(0, 300) << "..." << std::endl;
+                }
+            }
+            catch (const std::exception& e) {
+                std::cerr << "❌ Parse error (matches by date): " << e.what() << std::endl;
+                std::cerr << "   Response: " << matchesRes.text.substr(0, 300) << "..." << std::endl;
+            }
+        }
+        else {
+            std::cerr << "❌ API Error (matches by date): HTTP " << matchesRes.status_code << std::endl;
+            std::cerr << "   Response: " << matchesRes.text.substr(0, 300) << "..." << std::endl;
+        }
+
+        // ========== 2. Get LIVE matches separately for real-time updates ==========
+        std::cout << "📡 Fetching current live matches..." << std::endl;
         auto liveRes = cpr::Get(
             cpr::Url{ "https://free-api-live-football-data.p.rapidapi.com/football-current-live" },
-            cpr::Header{ {"x-rapidapi-key", apiKey}, {"x-rapidapi-host", "free-api-live-football-data.p.rapidapi.com"} }
+            cpr::Header{
+                {"x-rapidapi-key", apiKey},
+                {"x-rapidapi-host", "free-api-live-football-data.p.rapidapi.com"}
+            }
         );
 
         if (liveRes.status_code == 200) {
             try {
                 auto liveData = json::parse(liveRes.text);
+                int liveCount = 0;
+
                 if (liveData.contains("data") && liveData["data"].is_array()) {
-                    for (auto& match : liveData["data"]) {
-                        match["match_status"] = "LIVE";
-                        allMatches["data"].push_back(match);
-                    }
-                    std::cout << "✅ Live: " << liveData["data"].size() << " matches" << std::endl;
-                }
-            }
-            catch (const std::exception& e) {
-                std::cerr << "❌ Live matches parse error: " << e.what() << std::endl;
-            }
-        }
-        else {
-            std::cerr << "⚠️ Live endpoint error: " << liveRes.status_code << std::endl;
-        }
+                    liveCount = liveData["data"].size();
 
-        // 2. Try to get today's fixtures (all matches for today)
-        std::cout << "📡 Fetching today's schedule..." << std::endl;
-
-        // Try endpoint 1: football-get-league-fixtures
-        auto scheduleRes = cpr::Get(
-            cpr::Url{ "https://free-api-live-football-data.p.rapidapi.com/football-get-league-fixtures" },
-            cpr::Header{ {"x-rapidapi-key", apiKey}, {"x-rapidapi-host", "free-api-live-football-data.p.rapidapi.com"} },
-            cpr::Parameters{ {"leagueid", "1"}, {"date", getTodayDate()} } // Try Premier League first
-        );
-
-        if (scheduleRes.status_code == 200) {
-            try {
-                auto scheduleData = json::parse(scheduleRes.text);
-                if (scheduleData.contains("data") && scheduleData["data"].is_array()) {
-                    // Map live matches by ID to avoid duplicates
-                    std::map<std::string, bool> liveMatchIds;
-                    for (auto& match : allMatches["data"]) {
+                    // Create a map of existing match IDs to avoid duplicates
+                    std::map<std::string, size_t> existingIds;
+                    for (size_t i = 0; i < allMatches["data"].size(); i++) {
+                        auto& match = allMatches["data"][i];
                         if (match.contains("id")) {
-                            liveMatchIds[match["id"].get<std::string>()] = true;
+                            std::string id = match["id"].is_string() ?
+                                match["id"].get<std::string>() :
+                                std::to_string(match["id"].get<int>());
+                            existingIds[id] = i;
                         }
                     }
 
-                    for (auto& match : scheduleData["data"]) {
-                        std::string matchId = match.contains("id") ? match["id"].get<std::string>() : "";
-                        if (matchId.empty() || liveMatchIds.find(matchId) == liveMatchIds.end()) {
-                            match["match_status"] = "SCHEDULED";
-                            allMatches["data"].push_back(match);
+                    // Merge or update with live data
+                    for (auto& liveMatch : liveData["data"]) {
+                        if (liveMatch.contains("id")) {
+                            std::string matchId = liveMatch["id"].is_string() ?
+                                liveMatch["id"].get<std::string>() :
+                                std::to_string(liveMatch["id"].get<int>());
+
+                            if (existingIds.find(matchId) != existingIds.end()) {
+                                // Update existing match with live data (more current scores)
+                                allMatches["data"][existingIds[matchId]] = liveMatch;
+                            }
+                            else {
+                                // Add new live match
+                                allMatches["data"].push_back(liveMatch);
+                            }
+                        }
+                        else {
+                            // No ID, just add it
+                            allMatches["data"].push_back(liveMatch);
                         }
                     }
-                    std::cout << "✅ Schedule: " << scheduleData["data"].size() << " matches" << std::endl;
+
+                    std::cout << "✅ Live matches: " << liveCount << " matches" << std::endl;
+                }
+                else if (liveData.contains("response") && liveData["response"].is_array()) {
+                    liveCount = liveData["response"].size();
+                    std::cout << "✅ Live matches: " << liveCount << " matches" << std::endl;
+
+                    for (auto& liveMatch : liveData["response"]) {
+                        allMatches["data"].push_back(liveMatch);
+                    }
+                }
+                else {
+                    std::cout << "ℹ️  No live matches currently" << std::endl;
                 }
             }
             catch (const std::exception& e) {
-                std::cerr << "❌ Schedule parse error: " << e.what() << std::endl;
+                std::cerr << "❌ Live parse error: " << e.what() << std::endl;
+                std::cerr << "   Response: " << liveRes.text.substr(0, 300) << "..." << std::endl;
             }
         }
         else {
-            std::cerr << "⚠️ Schedule endpoint returned: " << scheduleRes.status_code << std::endl;
-            std::cerr << "   This is okay - we'll show live matches only" << std::endl;
+            std::cerr << "⚠️ Live endpoint error: HTTP " << liveRes.status_code << std::endl;
+            if (liveRes.status_code != 404) {
+                std::cerr << "   Response: " << liveRes.text.substr(0, 300) << "..." << std::endl;
+            }
         }
 
-        // 3. Try finished matches endpoint
-        std::cout << "📡 Checking for finished matches..." << std::endl;
-        auto finishedRes = cpr::Get(
-            cpr::Url{ "https://free-api-live-football-data.p.rapidapi.com/football-get-league-fixtures" },
-            cpr::Header{ {"x-rapidapi-key", apiKey}, {"x-rapidapi-host", "free-api-live-football-data.p.rapidapi.com"} },
-            cpr::Parameters{ {"leagueid", "1"}, {"date", getTodayDate()} }
-        );
-
-        // Save the combined data
+        // ========== Save the combined data ==========
         {
             std::lock_guard<std::mutex> lock(data_mutex);
             allMatches["total_matches"] = allMatches["data"].size();
+            allMatches["last_updated"] = timestamp;
             latest_match_data = allMatches.dump();
         }
 
         std::cout << "✅ Total matches available: " << allMatches["data"].size() << std::endl;
+        std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
 
         // Poll every 2 minutes
         std::cout << "⏳ Waiting 2 minutes for next update..." << std::endl;
@@ -164,14 +218,23 @@ int main() {
     std::thread worker(fetchAllMatches, myKey);
     worker.detach();
 
-    // Start API Server for Vercel
+    // Start API Server
     httplib::Server svr;
+
+    // CORS preflight handler (must be before other routes)
+    svr.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        res.status = 204;
+        });
 
     svr.Get("/scores", [](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(data_mutex);
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        res.set_header("Content-Type", "application/json");
         res.set_content(latest_match_data, "application/json");
         });
 
@@ -184,28 +247,22 @@ int main() {
         json health;
         health["status"] = "online";
         health["engine"] = "Realssa C++ Football Engine";
-        health["version"] = "2.0.0";
-        health["features"] = { "live_scores", "upcoming_matches", "finished_matches" };
+        health["version"] = "2.1.0";
+        health["features"] = { "live_scores", "upcoming_matches", "finished_matches", "match_details" };
 
         auto now = std::chrono::system_clock::now();
         auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
             now.time_since_epoch()
         ).count();
         health["server_time"] = timestamp;
+        health["server_date"] = getTodayDate();
 
         res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Content-Type", "application/json");
         res.set_content(health.dump(2), "application/json");
         });
 
-    // CORS preflight handler
-    svr.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type");
-        res.status = 204;
-        });
-
-    std::cout << "🚀 Realssa Backend running on Port 8080..." << std::endl;
+    std::cout << "\n🚀 Realssa Backend running on Port 8080..." << std::endl;
     std::cout << "📡 Endpoints available:" << std::endl;
     std::cout << "   - GET /         - Health check" << std::endl;
     std::cout << "   - GET /scores   - All match data (live, upcoming, finished)" << std::endl;
