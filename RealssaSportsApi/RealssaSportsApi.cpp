@@ -9,17 +9,32 @@
 #include <mutex>
 #include <ctime>
 #include <unordered_map>
-#include <algorithm>
 
 using json = nlohmann::json;
 
 // ============= CONFIGURATION =============
 const std::string OPENLIGA_BASE = "https://api.openligadb.de";
-const std::vector<std::string> LEAGUES = { "bl1", "bl2", "cl", "PL", "SA", "PD", "lg1" }; // Bundesliga 1/2, UCL, Premier League, Serie A, La Liga, Ligue 1
 
-const int CACHE_DURATION_MINUTES = 5;      // How often to fully refresh
-const int POLL_INTERVAL_LIVE_MIN = 1;      // 1 minute when live matches exist
-const int POLL_INTERVAL_NO_LIVE_MIN = 5;   // 5 minutes otherwise
+// Expanded list of leagues – most reliable ones first
+// You can add/remove shortcuts from https://api.openligadb.de/getavailableleagues
+const std::vector<std::string> LEAGUES = {
+    "bl1",      // 1. Bundesliga – best live support
+    "bl2",      // 2. Bundesliga
+    "bl3",      // 3. Liga
+    "dfb",      // DFB-Pokal
+    "cl",       // Champions League
+    "ucl",      // UEFA Champions League (alternative/current)
+    "el",       // Europa League
+    "uel",      // UEFA Europa League variant
+    "PL",       // Premier League
+    "SA",       // Serie A
+    "PD",       // La Liga
+    "lg1"       // Ligue 1 (older data, but included)
+};
+
+const int CACHE_DURATION_MINUTES = 5;       // How often to refresh data
+const int POLL_INTERVAL_LIVE_MIN = 1;     // Poll every 1 min when live games exist
+const int POLL_INTERVAL_NO_LIVE_MIN = 5;    // Poll every 5 min otherwise
 
 // ============= GLOBAL STATE =============
 json cached_fixtures;
@@ -28,20 +43,6 @@ std::mutex cache_mutex;
 int live_match_count = 0;
 
 // ============= UTILITY FUNCTIONS =============
-std::string getTodayDate() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::tm timeinfo;
-#ifdef _WIN32
-    localtime_s(&timeinfo, &now_time);
-#else
-    localtime_r(&now_time, &timeinfo);
-#endif
-    char buffer[11];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
-    return std::string(buffer);
-}
-
 std::pair<int, std::string> deriveStatus(const json& match) {
     bool finished = match.value("matchIsFinished", false);
     if (finished) return { 6, "FT" };
@@ -49,17 +50,20 @@ std::pair<int, std::string> deriveStatus(const json& match) {
     std::string dt_str = match.value("matchDateTimeUTC", "");
     if (dt_str.empty()) return { 1, "NS" };
 
-    // Rough ISO parsing to time_t (UTC assumed)
+    // Parse ISO UTC time roughly
     std::tm tm{};
     if (strptime(dt_str.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tm)) {
-        auto match_time = timegm(&tm);  // UTC
+        auto match_time = timegm(&tm);  // UTC time_t
         auto now = std::time(nullptr);
         auto diff_min = (now - match_time) / 60;
 
-        if (diff_min > -30 && diff_min < 210) {  // ~3.5 hour window around kickoff
+        // Consider live if within ~30 min before → 3.5 hours after kickoff
+        if (diff_min > -30 && diff_min < 210) {
             return { 2, "LIVE" };
         }
-        if (diff_min >= 210) return { 6, "FT" };   // Auto-finish very old matches
+        if (diff_min >= 210) {
+            return { 6, "FT" };  // Auto-finish old matches
+        }
     }
     return { 1, "NS" };
 }
@@ -68,16 +72,19 @@ json formatOpenLigaMatch(const json& raw) {
     json m;
     try {
         m["id"] = raw.value("matchID", 0);
+
+        // Timestamp (unix seconds) for frontend date handling
         std::string dt = raw.value("matchDateTime", "");
         if (!dt.empty()) {
-            // Convert to unix timestamp for frontend compatibility
             std::tm tm{};
-            strptime(dt.c_str(), "%Y-%m-%dT%H:%M:%S", &tm);  // local time zone
+            strptime(dt.c_str(), "%Y-%m-%dT%H:%M:%S", &tm);  // note: local offset, approx
             m["timestamp"] = static_cast<int64_t>(std::mktime(&tm));
         }
 
-        // Date label (for grouping)
-        m["date"] = dt.substr(0, 10);  // YYYY-MM-DD
+        // Date string for grouping
+        if (dt.size() >= 10) {
+            m["date"] = dt.substr(0, 10);
+        }
 
         // Teams
         auto t1 = raw.value("team1", json{});
@@ -89,9 +96,9 @@ json formatOpenLigaMatch(const json& raw) {
         m["away_team_id"] = t2.value("teamId", 0);
         m["away_team_logo"] = t2.value("teamIconUrl", "");
 
-        // League (we can improve this mapping later)
+        // League info
         m["league"] = raw.value("leagueName", "Unknown League");
-        m["league_country"] = "Various";
+        m["league_country"] = "Various / Europe";
 
         // Scores
         int h = 0, a = 0, ht_h = 0, ht_a = 0;
@@ -115,19 +122,18 @@ json formatOpenLigaMatch(const json& raw) {
         m["home_score_ht"] = ht_h;
         m["away_score_ht"] = ht_a;
 
-        // Status
+        // Status & live time
         auto [sid, sname] = deriveStatus(raw);
         m["statusId"] = sid;
         m["statusName"] = sname;
 
-        // Live time approximation
         if (sname == "LIVE" && raw.contains("goals") && !raw["goals"].empty()) {
             int minute = raw["goals"].back().value("matchMinute", 0);
             m["time"] = std::to_string(minute) + "'";
         }
     }
     catch (const std::exception& e) {
-        std::cerr << "Format error: " << e.what() << std::endl;
+        std::cerr << "Error formatting match: " << e.what() << std::endl;
     }
     return m;
 }
@@ -137,7 +143,7 @@ int countLiveMatches() {
     int count = 0;
     if (cached_fixtures.contains("data") && cached_fixtures["data"].is_array()) {
         for (const auto& match : cached_fixtures["data"]) {
-            if (match.value("statusId", 1) == 2) count++;
+            if (match.value("statusId", 1) == 2) ++count;
         }
     }
     return count;
@@ -146,11 +152,13 @@ int countLiveMatches() {
 void refreshFixtureCache() {
     auto now = std::chrono::system_clock::now();
     auto minutes_since = std::chrono::duration_cast<std::chrono::minutes>(now - last_fixture_fetch).count();
+
     if (minutes_since < CACHE_DURATION_MINUTES && !cached_fixtures.empty()) {
-        return;
+        return;  // Cache still fresh
     }
 
-    std::cout << "\n🔄 Refreshing OpenLigaDB data..." << std::endl;
+    std::cout << "\n🔄 Refreshing OpenLigaDB cache...\n";
+
     json all;
     all["data"] = json::array();
 
@@ -167,15 +175,15 @@ void refreshFixtureCache() {
                     for (const auto& raw : data) {
                         all["data"].push_back(formatOpenLigaMatch(raw));
                     }
-                    std::cout << "  → " << data.size() << " matches from " << shortcut << std::endl;
+                    std::cout << "  → " << data.size() << " matches from " << shortcut << "\n";
                 }
             }
             catch (const std::exception& e) {
-                std::cerr << "Parse error for " << shortcut << ": " << e.what() << std::endl;
+                std::cerr << "  Parse error for " << shortcut << ": " << e.what() << "\n";
             }
         }
         else {
-            std::cout << "  Failed to fetch " << shortcut << " (" << resp.status_code << ")" << std::endl;
+            std::cout << "  Failed " << shortcut << " (" << resp.status_code << ")\n";
         }
     }
 
@@ -198,7 +206,7 @@ void backgroundPoller() {
         }
 
         int interval_min = (live > 0) ? POLL_INTERVAL_LIVE_MIN : POLL_INTERVAL_NO_LIVE_MIN;
-        std::cout << "Live matches: " << live << " | Next poll in " << interval_min << " min\n";
+        std::cout << "Live: " << live << " | Next poll: " << interval_min << " min\n";
         std::this_thread::sleep_for(std::chrono::minutes(interval_min));
     }
 }
@@ -208,7 +216,8 @@ int main() {
     crow::SimpleApp app;
 
     std::cout << "⚡ RealSSA Sports API – OpenLigaDB Edition\n";
-    std::cout << "   Free, no key, focused on European football\n\n";
+    std::cout << "   Free forever – no key, no quota\n";
+    std::cout << "   Leagues: " << LEAGUES.size() << " configured\n\n";
 
     cached_fixtures["data"] = json::array();
     last_fixture_fetch = std::chrono::system_clock::now() - std::chrono::minutes(CACHE_DURATION_MINUTES + 10);
@@ -226,7 +235,7 @@ int main() {
         return res;
             });
 
-    // SCORES
+    // SCORES – main endpoint
     CROW_ROUTE(app, "/scores")
         ([]() {
             {
@@ -249,7 +258,7 @@ int main() {
             return res;
             });
 
-    // HEALTH (optional – remove stats route since OpenLiga doesn't have detailed stats)
+    // HEALTH
     CROW_ROUTE(app, "/health")
         ([]() {
         json health;
